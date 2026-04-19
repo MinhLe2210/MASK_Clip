@@ -4,6 +4,7 @@ ftfy==6.3.1
 IMDLBenCo==0.1.22
 numpy
 omegaconf==2.3.0
+packaging
 opencv_contrib_python==4.10.0.84
 opencv_python==4.7.0.68
 opencv_python_headless==4.9.0.80
