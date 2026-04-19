@@ -76,11 +76,30 @@ main_keys = {
 }
 
 
+def resolve_model_setting_name(model_setting_name):
+    if model_setting_name in main_keys:
+        return model_setting_name
+
+    normalized_name = model_setting_name.lower().replace("-", "").replace("_", "")
+    normalized_keys = {
+        key.lower().replace("-", "").replace("_", ""): key
+        for key in main_keys
+    }
+    if normalized_name in normalized_keys:
+        return normalized_keys[normalized_name]
+
+    valid_names = ", ".join(sorted(main_keys))
+    raise ValueError(
+        f"Unknown model_setting_name '{model_setting_name}'. "
+        f"Valid options: {valid_names}"
+    )
+
+
 @MODELS.register_module()
 class MaskCLIP(nn.Module):
     def __init__(self, model_setting_name):
         super().__init__()
-        settings = main_keys[model_setting_name]
+        settings = main_keys[resolve_model_setting_name(model_setting_name)]
         self.selected_layers = settings['selected_layers']
         self.resolution = settings['resolution']
         self.clip, _ = clip.load(settings['model_name'])
