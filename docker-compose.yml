@@ -47,23 +47,58 @@ services:
     environment:
       HOST: 0.0.0.0
       CLASSIFIER_PORT: 8001
-      CLASSIFIER_ENGINE_PATH: ${CLASSIFIER_ENGINE_PATH:-}
-      CLASSIFIER_INPUT_NAME: ${CLASSIFIER_INPUT_NAME:-pixel_values}
-      CLASSIFIER_OUTPUT_NAME: ${CLASSIFIER_OUTPUT_NAME:-}
+      CLASSIFIER_ENGINE_PATH: ${CLASSIFIER_ENGINE_PATH:-/models/classifier.engine}
+      CLASSIFIER_INPUT_NAME: ${CLASSIFIER_INPUT_NAME:-input}
+      CLASSIFIER_OUTPUT_NAME: ${CLASSIFIER_OUTPUT_NAME:-output}
       CLASSIFIER_LABELS: ${CLASSIFIER_LABELS:-negative,positive}
-      CLASSIFIER_API_MODEL: ${CLASSIFIER_API_MODEL:-image-classifier-trt}
       CLASSIFIER_BATCH_SIZE: 16
       CLASSIFIER_BATCH_TIMEOUT: ${CLASSIFIER_BATCH_TIMEOUT:-0.05}
-      CLASSIFIER_IMAGE_HEIGHT: ${CLASSIFIER_IMAGE_HEIGHT:-224}
-      CLASSIFIER_IMAGE_WIDTH: ${CLASSIFIER_IMAGE_WIDTH:-224}
-      MAX_IMAGES_PER_REQUEST: ${CLASSIFIER_MAX_IMAGES_PER_REQUEST:-1}
-      LITSERVE_ACCELERATOR: cpu
-      LITSERVE_DEVICES: 1
+      CLASSIFIER_INPUT_SIZE: ${CLASSIFIER_INPUT_SIZE:-384}
+      MAX_IMAGES_PER_REQUEST: ${CLASSIFIER_MAX_IMAGES_PER_REQUEST:-16}
+      LITSERVE_ACCELERATOR: ${CLASSIFIER_LITSERVE_ACCELERATOR:-gpu}
+      LITSERVE_DEVICES: ${CLASSIFIER_LITSERVE_DEVICES:-1}
       LITSERVE_WORKERS_PER_DEVICE: ${CLASSIFIER_WORKERS_PER_DEVICE:-1}
       LITSERVE_REQUEST_TIMEOUT: ${CLASSIFIER_REQUEST_TIMEOUT:-120}
-      CUDA_VISIBLE_DEVICES: ""
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./:/app
+      - ${MODEL_DIR:-./models}:/models:ro
+    cpus: "1.0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  pipeline:
+    image: ${OPENSDI_IMAGE:-opensdi:latest}
+    container_name: opensdi-pipeline
+    working_dir: /app
+    command: python pipeline_server.py
+    ports:
+      - "${PIPELINE_PORT:-8002}:8002"
+    environment:
+      HOST: 0.0.0.0
+      PIPELINE_PORT: 8002
+      DEDUP_API_URL: http://dedup:8000/dedup
+      CLASSIFIER_API_URL: http://classification:8001/classify
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_VLM_MODEL: ${OPENAI_VLM_MODEL:-gpt-5-mini}
+      OPENAI_TIMEOUT: ${OPENAI_TIMEOUT:-60}
+      PIPELINE_REQUEST_TIMEOUT: ${PIPELINE_REQUEST_TIMEOUT:-60}
+      PIPELINE_BATCH_SIZE: ${PIPELINE_BATCH_SIZE:-1}
+      LITSERVE_ACCELERATOR: cpu
+      LITSERVE_DEVICES: 1
+      LITSERVE_WORKERS_PER_DEVICE: ${PIPELINE_WORKERS_PER_DEVICE:-1}
+      LITSERVE_REQUEST_TIMEOUT: ${PIPELINE_LITSERVE_REQUEST_TIMEOUT:-180}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./:/app
     cpus: "1.0"
+    depends_on:
+      - dedup
+      - classification
     restart: unless-stopped

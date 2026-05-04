@@ -3,24 +3,27 @@
 OpenSDI currently contains two runtime flows:
 
 - `/dedup`: LitServe API for base64 image deduplication with Milvus.
-- `/v1/chat/completions`: OpenAI-compatible dummy classification API that can call a TensorRT engine when available.
+- `/classify`: LitServe API for 2-class TensorRT classification.
+- `/analyze`: pipeline API that runs dedup -> TensorRT classification -> OpenAI multimodal analysis.
 
 ## Project Layout
 
 ```text
 .
 |-- main.py                    # LitServe wiring for the dedup API
-|-- classification_server.py   # LitServe OpenAI-compatible classification API
+|-- classification_server.py   # LitServe TensorRT classification API
+|-- pipeline_server.py         # Dedup -> classify -> OpenAI VLM pipeline
 |-- convert_to_onnx.py         # Export DINOv3 image model to ONNX
 |-- script.sh                  # Convert ONNX to TensorRT engine with Docker trtexec
-|-- openai_classify_client.py  # Test client for classification_server.py
+|-- pipeline_client.py         # Test client for pipeline_server.py
 `-- src/
     |-- config.py              # Environment settings
     |-- dedup_service.py       # Deduplication workflow
     |-- embedder.py            # Hugging Face image embedding model
     |-- image_io.py            # Base64/PIL helpers
     |-- milvus_store.py        # Milvus collection, search, insert, retry
-    `-- request_parsing.py     # LitServe request batching/unbatching helpers
+    |-- request_parsing.py     # LitServe request batching/unbatching helpers
+    `-- trt_runner.py          # TensorRT engine loader/inference helper
 ```
 
 ## Dedup API
@@ -117,64 +120,121 @@ SKIP_SHAPES=1 ./script.sh static_model.onnx static_model.engine
 
 ## Classification API
 
-Run in dummy mode first:
+The classification service is a TensorRT `.engine` API. It expects an engine
+with one image input tensor and one 2-logit output tensor, for example:
 
 ```bash
-python classification_server.py
+Input tensor: input, shape=(B, 3, 384, 384)
+Output tensor: output, shape=(B, 2)
 ```
 
-Run with TensorRT:
+Run:
 
 ```bash
 export CLASSIFIER_ENGINE_PATH=./classifier.engine
 export CLASSIFIER_LABELS=negative,positive
-export CLASSIFIER_INPUT_NAME=pixel_values
+export CLASSIFIER_INPUT_NAME=input
+export CLASSIFIER_OUTPUT_NAME=output
+export CLASSIFIER_INPUT_SIZE=384
+export CLASSIFIER_BATCH_SIZE=16
 export CLASSIFIER_PORT=8001
 python classification_server.py
 ```
 
-Call with the OpenAI-compatible client:
+Request:
 
 ```bash
-python openai_classify_client.py --image ./sample.jpg
+curl -X POST http://127.0.0.1:8001/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "request_id": "cls-001",
+    "images": [
+      {
+        "image_id": "img-001",
+        "image_base64": "data:image/jpeg;base64,..."
+      }
+    ]
+  }'
 ```
 
-Or with a URL:
+Preprocessing matches the TensorRT example:
+
+```text
+RGB -> resize 384x384 BICUBIC -> /255 -> ImageNet mean/std -> NCHW float32
+```
+
+## Pipeline API
+
+The pipeline service runs:
+
+```text
+dedup API -> if unique, TensorRT classification API -> OpenAI multimodal model
+```
+
+Required environment:
 
 ```bash
-python openai_classify_client.py \
-  --image-url http://images.cocodataset.org/val2017/000000039769.jpg
+export OPENAI_API_KEY=...
+export OPENAI_VLM_MODEL=gpt-5-mini
+export DEDUP_API_URL=http://127.0.0.1:8000/dedup
+export CLASSIFIER_API_URL=http://127.0.0.1:8001/classify
 ```
 
-The classification endpoint accepts OpenAI-style `messages` with an image block and returns a JSON string in `choices[0].message.content`.
+Run:
+
+```bash
+python pipeline_server.py
+```
+
+Call:
+
+```bash
+python pipeline_client.py --image ./sample.jpg
+```
+
+Endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8002/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "request_id": "pipe-001",
+    "images": [
+      {
+        "image_id": "img-001",
+        "image_base64": "data:image/jpeg;base64,..."
+      }
+    ]
+  }'
+```
 
 ## Docker Compose
 
-`docker-compose.yml` runs the two model services separately:
+`docker-compose.yml` runs the services separately:
 
 - `dedup`: 1 CPU, 1 NVIDIA GPU, LitServe batch size 32.
-- `classification`: 1 CPU, CPU-only by default, LitServe batch size 16.
+- `classification`: 1 CPU, 1 NVIDIA GPU, TensorRT classification, LitServe batch size 16.
+- `pipeline`: 1 CPU, calls dedup, classification, and OpenAI multimodal API.
 
 Build or provide an application image first, then run Compose:
 
 ```bash
 export OPENSDI_IMAGE=opensdi:latest
 export MILVUS_HOST=milvus
+export CLASSIFIER_ENGINE_PATH=/models/classifier.engine
+export OPENAI_API_KEY=...
 docker compose up -d
 ```
 
 Ports:
 
 - Dedup API: `http://127.0.0.1:8000/dedup`
-- Classification API: `http://127.0.0.1:8001/v1/chat/completions`
-
-If the classification TensorRT engine needs GPU execution, remove the CPU-only
-`CUDA_VISIBLE_DEVICES` override and add an NVIDIA GPU reservation to the
-`classification` service.
+- Classification API: `http://127.0.0.1:8001/classify`
+- Pipeline API: `http://127.0.0.1:8002/analyze`
 
 ## Push Image To Harbor
 
-`docker-compose.yml` uses `OPENSDI_IMAGE` for both services. To push the app
+`docker-compose.yml` uses `OPENSDI_IMAGE` for all app services. To push the app
 image to Harbor:
 
 ```bash
@@ -203,6 +263,8 @@ services:
   dedup:
     build: .
   classification:
+    build: .
+  pipeline:
     build: .
 ```
 
