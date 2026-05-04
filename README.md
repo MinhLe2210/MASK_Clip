@@ -148,6 +148,81 @@ python openai_classify_client.py \
 
 The classification endpoint accepts OpenAI-style `messages` with an image block and returns a JSON string in `choices[0].message.content`.
 
+## Docker Compose
+
+`docker-compose.yml` runs the two model services separately:
+
+- `dedup`: 1 CPU, 1 NVIDIA GPU, LitServe batch size 32.
+- `classification`: 1 CPU, CPU-only by default, LitServe batch size 16.
+
+Build or provide an application image first, then run Compose:
+
+```bash
+export OPENSDI_IMAGE=opensdi:latest
+export MILVUS_HOST=milvus
+docker compose up -d
+```
+
+Ports:
+
+- Dedup API: `http://127.0.0.1:8000/dedup`
+- Classification API: `http://127.0.0.1:8001/v1/chat/completions`
+
+If the classification TensorRT engine needs GPU execution, remove the CPU-only
+`CUDA_VISIBLE_DEVICES` override and add an NVIDIA GPU reservation to the
+`classification` service.
+
+## Push Image To Harbor
+
+`docker-compose.yml` uses `OPENSDI_IMAGE` for both services. To push the app
+image to Harbor:
+
+```bash
+export HARBOR_REGISTRY=harbor.example.com
+export HARBOR_PROJECT=opensdi
+export IMAGE_TAG=1.0.0
+export OPENSDI_IMAGE=$HARBOR_REGISTRY/$HARBOR_PROJECT/opensdi:$IMAGE_TAG
+
+docker login $HARBOR_REGISTRY
+docker build -t $OPENSDI_IMAGE .
+docker push $OPENSDI_IMAGE
+```
+
+You can also use Docker Compose push after the image exists locally:
+
+```bash
+export OPENSDI_IMAGE=harbor.example.com/opensdi/opensdi:1.0.0
+docker compose push
+```
+
+If you want Compose to build and push in one flow, create a local override file:
+
+```yaml
+# docker-compose.build.yml
+services:
+  dedup:
+    build: .
+  classification:
+    build: .
+```
+
+Then run:
+
+```bash
+export OPENSDI_IMAGE=harbor.example.com/opensdi/opensdi:1.0.0
+docker compose -f docker-compose.yml -f docker-compose.build.yml build
+docker compose -f docker-compose.yml -f docker-compose.build.yml push
+```
+
+In Rancher, deploy workloads with the same image name:
+
+```text
+harbor.example.com/opensdi/opensdi:1.0.0
+```
+
+For private Harbor projects, add Harbor credentials in Rancher/Kubernetes as a
+registry secret, then attach that secret to the workload image pull settings.
+
 ## Notes
 
 - `main.py` is intentionally small and keeps only LitServe API/server wiring.

@@ -363,8 +363,18 @@ def openai_chat_response(
 
 class OpenAIImageClassificationAPI(ls.LitAPI):
     def __init__(self):
-        max_batch_size = int(os.getenv("LITSERVE_MAX_BATCH_SIZE", "8"))
-        batch_timeout = float(os.getenv("LITSERVE_BATCH_TIMEOUT", "0.05"))
+        max_batch_size = int(
+            os.getenv(
+                "CLASSIFIER_BATCH_SIZE",
+                os.getenv("LITSERVE_MAX_BATCH_SIZE", "8"),
+            )
+        )
+        batch_timeout = float(
+            os.getenv(
+                "CLASSIFIER_BATCH_TIMEOUT",
+                os.getenv("LITSERVE_BATCH_TIMEOUT", "0.05"),
+            )
+        )
         super().__init__(
             api_path="/v1/chat/completions",
             max_batch_size=max_batch_size,

@@ -1,0 +1,69 @@
+services:
+  dedup:
+    image: ${OPENSDI_IMAGE:-opensdi:latest}
+    container_name: opensdi-dedup
+    working_dir: /app
+    command: python main.py
+    ports:
+      - "${DEDUP_PORT:-8000}:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      MODEL_PATH: ${MODEL_PATH:-facebook/dinov3-vits16plus-pretrain-lvd1689m}
+      EMBED_DIM: ${EMBED_DIM:-768}
+      DUP_THRESHOLD: ${DUP_THRESHOLD:-0.999995}
+      COLLECTION_NAME: ${COLLECTION_NAME:-AI_detector_image_dedup_b64}
+      MILVUS_HOST: ${MILVUS_HOST:-milvus}
+      MILVUS_PORT: ${MILVUS_PORT:-19530}
+      LITSERVE_ACCELERATOR: ${DEDUP_LITSERVE_ACCELERATOR:-gpu}
+      LITSERVE_DEVICES: ${DEDUP_LITSERVE_DEVICES:-1}
+      LITSERVE_WORKERS_PER_DEVICE: ${DEDUP_WORKERS_PER_DEVICE:-1}
+      LITSERVE_MAX_BATCH_SIZE: 32
+      LITSERVE_BATCH_TIMEOUT: ${DEDUP_BATCH_TIMEOUT:-0.05}
+      LITSERVE_REQUEST_TIMEOUT: ${DEDUP_REQUEST_TIMEOUT:-120}
+      LITSERVE_MAX_PAYLOAD_SIZE: ${DEDUP_MAX_PAYLOAD_SIZE:-100MB}
+      MAX_IMAGES_PER_REQUEST: ${DEDUP_MAX_IMAGES_PER_REQUEST:-64}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./:/app
+      - ${HF_CACHE_DIR:-./.cache/huggingface}:/root/.cache/huggingface
+    cpus: "1.0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  classification:
+    image: ${OPENSDI_IMAGE:-opensdi:latest}
+    container_name: opensdi-classification
+    working_dir: /app
+    command: python classification_server.py
+    ports:
+      - "${CLASSIFIER_PORT:-8001}:8001"
+    environment:
+      HOST: 0.0.0.0
+      CLASSIFIER_PORT: 8001
+      CLASSIFIER_ENGINE_PATH: ${CLASSIFIER_ENGINE_PATH:-}
+      CLASSIFIER_INPUT_NAME: ${CLASSIFIER_INPUT_NAME:-pixel_values}
+      CLASSIFIER_OUTPUT_NAME: ${CLASSIFIER_OUTPUT_NAME:-}
+      CLASSIFIER_LABELS: ${CLASSIFIER_LABELS:-negative,positive}
+      CLASSIFIER_API_MODEL: ${CLASSIFIER_API_MODEL:-image-classifier-trt}
+      CLASSIFIER_BATCH_SIZE: 16
+      CLASSIFIER_BATCH_TIMEOUT: ${CLASSIFIER_BATCH_TIMEOUT:-0.05}
+      CLASSIFIER_IMAGE_HEIGHT: ${CLASSIFIER_IMAGE_HEIGHT:-224}
+      CLASSIFIER_IMAGE_WIDTH: ${CLASSIFIER_IMAGE_WIDTH:-224}
+      MAX_IMAGES_PER_REQUEST: ${CLASSIFIER_MAX_IMAGES_PER_REQUEST:-1}
+      LITSERVE_ACCELERATOR: cpu
+      LITSERVE_DEVICES: 1
+      LITSERVE_WORKERS_PER_DEVICE: ${CLASSIFIER_WORKERS_PER_DEVICE:-1}
+      LITSERVE_REQUEST_TIMEOUT: ${CLASSIFIER_REQUEST_TIMEOUT:-120}
+      CUDA_VISIBLE_DEVICES: ""
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./:/app
+    cpus: "1.0"
+    restart: unless-stopped
