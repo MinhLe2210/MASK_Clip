@@ -112,7 +112,14 @@ def normalize_images_payload(request: dict[str, Any]) -> tuple[str, list[dict[st
 
 
 def response_to_dict(response: requests.Response) -> dict[str, Any]:
-    response.raise_for_status()
+    if not response.ok:
+        body = response.text.strip()
+        if len(body) > 1000:
+            body = f"{body[:1000]}...<truncated>"
+        raise RuntimeError(
+            f"Upstream HTTP {response.status_code} for {response.url}: "
+            f"{body or '<empty response body>'}"
+        )
     payload = response.json()
     if isinstance(payload, list):
         if not payload:
