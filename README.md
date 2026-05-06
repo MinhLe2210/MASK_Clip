@@ -177,6 +177,7 @@ Required environment:
 ```bash
 export OPENAI_API_KEY=...
 export OPENAI_VLM_MODEL=gpt-5-mini
+export OPENAI_PROXY=http://proxy.example.com:8080
 export DEDUP_API_URL=http://127.0.0.1:8000/dedup
 export CLASSIFIER_API_URL=http://127.0.0.1:8001/classify
 ```
@@ -202,6 +203,7 @@ export DEDUP_ENGINE_PATH=./models/dedup.engine
 export CLASSIFIER_ENGINE_PATH=./models/classifier.engine
 export MILVUS_HOST=127.0.0.1
 export OPENAI_API_KEY=...
+export OPENAI_PROXY=http://proxy.example.com:8080
 ```
 
 Run:
@@ -243,6 +245,7 @@ export MILVUS_HOST=milvus
 export DEDUP_ENGINE_PATH=/models/dedup.engine
 export CLASSIFIER_ENGINE_PATH=/models/classifier.engine
 export OPENAI_API_KEY=...
+export OPENAI_PROXY=http://proxy.example.com:8080
 docker compose up -d
 ```
 

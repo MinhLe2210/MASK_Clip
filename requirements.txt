@@ -6,16 +6,16 @@ requests
 openai
 numpy
 Pillow
-pymilvus
+pymilvus==2.3.14
 
 # TensorRT runtime
 # If your environment uses a CUDA-specific TensorRT wheel, replace `tensorrt`
 # with the matching variant, for example `tensorrt-cu12`.
-tensorrt
+tensorrt-cu13
 cuda-python
 
 # ONNX export / verification utilities
-torch
+torch==2.11
 transformers
 onnx
 onnxruntime

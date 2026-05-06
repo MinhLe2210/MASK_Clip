@@ -27,6 +27,7 @@ class PipelineSettings:
     dedup_api_url: str
     classifier_api_url: str
     openai_model: str
+    openai_proxy: str | None
     openai_timeout: float
     request_timeout: float
     vlm_prompt: str
@@ -40,6 +41,7 @@ class PipelineSettings:
                 "http://classification:8001/classify",
             ),
             openai_model=os.getenv("OPENAI_VLM_MODEL", "gpt-5-mini"),
+            openai_proxy=os.getenv("OPENAI_PROXY") or None,
             openai_timeout=float(os.getenv("OPENAI_TIMEOUT", "60")),
             request_timeout=float(os.getenv("PIPELINE_REQUEST_TIMEOUT", "60")),
             vlm_prompt=os.getenv(
@@ -141,10 +143,14 @@ def image_ref_for_openai(item: dict[str, str]) -> str:
 
 
 class OpenAIVisionClient:
-    def __init__(self, model: str, timeout: float):
-        from openai import OpenAI
+    def __init__(self, model: str, timeout: float, proxy: str | None = None):
+        from openai import DefaultHttpxClient, OpenAI
 
-        self.client = OpenAI(timeout=timeout)
+        client_kwargs: dict[str, Any] = {"timeout": timeout}
+        if proxy:
+            client_kwargs["http_client"] = DefaultHttpxClient(proxy=proxy)
+
+        self.client = OpenAI(**client_kwargs)
         self.model = model
 
     def analyze(
@@ -201,6 +207,7 @@ class DedupClassifyVLMAPI(ls.LitAPI):
         self.openai_client = OpenAIVisionClient(
             model=self.cfg.openai_model,
             timeout=self.cfg.openai_timeout,
+            proxy=self.cfg.openai_proxy,
         )
 
     def decode_request(self, request: dict[str, Any], **kwargs) -> dict[str, Any]:
