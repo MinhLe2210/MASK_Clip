@@ -222,8 +222,18 @@ class DedupClassifyVLMAPI(ls.LitAPI):
     def batch(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return inputs
 
-    def predict(self, batch: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
-        return [self._predict_one(request) for request in batch]
+    def predict(
+        self,
+        batch: dict[str, Any] | list[dict[str, Any]],
+        **kwargs,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        if isinstance(batch, dict):
+            return self._predict_one(batch)
+        if isinstance(batch, list):
+            return [self._predict_one(request) for request in batch]
+        raise TypeError(
+            "predict() expected a decoded request dict or a batched list of request dicts."
+        )
 
     def unbatch(self, output: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return output
