@@ -15,15 +15,16 @@ def decode_dedup_request(
 
     if "images" in request:
         images = request["images"]
-    elif "image_base64" in request:
+    elif "image_base64" in request or "image_url" in request:
         images = [
             {
                 "image_id": request.get("image_id"),
-                "image_base64": request["image_base64"],
+                "image_base64": request.get("image_base64"),
+                "image_url": request.get("image_url"),
             }
         ]
     else:
-        raise ValueError("Request must contain 'images' or 'image_base64'.")
+        raise ValueError("Request must contain 'images', 'image_base64', or 'image_url'.")
 
     if not isinstance(images, list):
         raise ValueError("'images' must be a list.")
@@ -38,21 +39,26 @@ def decode_dedup_request(
     for idx, item in enumerate(images):
         if isinstance(item, str):
             image_id = f"{request_id}:{idx}"
-            image_b64 = item
+            image_ref = item
         elif isinstance(item, dict):
             image_id = str(item.get("image_id") or f"{request_id}:{idx}")
-            image_b64 = item.get("image_base64") or item.get("b64")
+            image_ref = (
+                item.get("image_base64")
+                or item.get("b64")
+                or item.get("image_url")
+                or item.get("url")
+            )
         else:
             raise ValueError("Each image must be a string or object.")
 
-        if not image_b64 or not isinstance(image_b64, str):
-            raise ValueError("Each image must contain image_base64.")
+        if not image_ref or not isinstance(image_ref, str):
+            raise ValueError("Each image must contain image_base64 or image_url.")
 
         items.append(
             {
                 "request_id": request_id,
                 "image_id": image_id,
-                "image_base64": image_b64,
+                "image_ref": image_ref,
             }
         )
 

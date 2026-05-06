@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 
 from src.embedder import ImageEmbedder
-from src.image_io import bytes_to_pil, decode_base64_to_bytes
+from src.image_io import bytes_from_ref, bytes_to_pil
 from src.milvus_store import MilvusDedupStore
 
 
@@ -47,7 +47,7 @@ class ImageDedupService:
         decoded = []
         for idx, item in enumerate(flat_items):
             try:
-                image_bytes = decode_base64_to_bytes(item["image_base64"])
+                image_bytes = bytes_from_ref(item["image_ref"])
                 sha256 = hashlib.sha256(image_bytes).hexdigest()
                 image = bytes_to_pil(image_bytes)
 
@@ -63,7 +63,7 @@ class ImageDedupService:
                 flat_results[idx] = {
                     "image_id": item.get("image_id"),
                     "status": "error",
-                    "error": f"invalid_image_base64: {exc}",
+                    "error": f"invalid_image: {exc}",
                 }
 
         if decoded:
