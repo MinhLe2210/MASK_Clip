@@ -9,8 +9,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8000
-      MODEL_PATH: ${MODEL_PATH:-facebook/dinov3-vits16plus-pretrain-lvd1689m}
-      EMBED_DIM: ${EMBED_DIM:-768}
+      MODEL_PATH: ${MODEL_PATH:-/models/dedup.engine}
+      DEDUP_ENGINE_PATH: ${DEDUP_ENGINE_PATH:-/models/dedup.engine}
+      EMBED_DIM: ${EMBED_DIM:-384}
       DUP_THRESHOLD: ${DUP_THRESHOLD:-0.999995}
       COLLECTION_NAME: ${COLLECTION_NAME:-AI_detector_image_dedup_b64}
       MILVUS_HOST: ${MILVUS_HOST:-milvus}
@@ -26,7 +27,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - ./:/app
-      - ${HF_CACHE_DIR:-./.cache/huggingface}:/root/.cache/huggingface
+      - ${MODEL_DIR:-./models}:/models:ro
     cpus: "1.0"
     deploy:
       resources:

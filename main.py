@@ -4,7 +4,6 @@ import uuid
 from typing import Any
 
 import litserve as ls
-import torch
 from dotenv import load_dotenv
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -78,14 +77,7 @@ class Base64ImageDedupAPI(ls.LitAPI):
 
     def setup(self, device):
         self.cfg = Settings.from_env()
-
-        torch_device = torch.device(
-            device
-            if isinstance(device, str)
-            else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-
-        embedder = ImageEmbedder(self.cfg, torch_device)
+        embedder = ImageEmbedder(self.cfg, device)
         store = MilvusDedupStore(self.cfg)
         self.service = ImageDedupService(embedder=embedder, store=store)
         self.service.prepare()

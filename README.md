@@ -15,11 +15,12 @@ OpenSDI currently contains two runtime flows:
 |-- pipeline_server.py         # Dedup -> classify -> OpenAI VLM pipeline
 |-- convert_to_onnx.py         # Export DINOv3 image model to ONNX
 |-- script.sh                  # Convert ONNX to TensorRT engine with Docker trtexec
+|-- run_pipeline.sh            # Start dedup, classification, and pipeline locally
 |-- pipeline_client.py         # Test client for pipeline_server.py
 `-- src/
     |-- config.py              # Environment settings
     |-- dedup_service.py       # Deduplication workflow
-    |-- embedder.py            # Hugging Face image embedding model
+    |-- embedder.py            # TensorRT image embedding model
     |-- image_io.py            # Base64/PIL helpers
     |-- milvus_store.py        # Milvus collection, search, insert, retry
     |-- request_parsing.py     # LitServe request batching/unbatching helpers
@@ -31,7 +32,7 @@ OpenSDI currently contains two runtime flows:
 Required environment variables:
 
 ```bash
-export MODEL_PATH=facebook/dinov3-vits16plus-pretrain-lvd1689m
+export DEDUP_ENGINE_PATH=./models/dedup.engine
 export MILVUS_HOST=127.0.0.1
 export MILVUS_PORT=19530
 ```
@@ -39,7 +40,7 @@ export MILVUS_PORT=19530
 Common optional variables:
 
 ```bash
-export EMBED_DIM=768
+export EMBED_DIM=384
 export DUP_THRESHOLD=0.999995
 export COLLECTION_NAME=AI_detector_image_dedup_b64
 export MAX_IMAGES_PER_REQUEST=64
@@ -192,6 +193,24 @@ Call:
 python pipeline_client.py --image ./sample.jpg
 ```
 
+## Run Full Pipeline Locally
+
+Required environment:
+
+```bash
+export DEDUP_ENGINE_PATH=./models/dedup.engine
+export CLASSIFIER_ENGINE_PATH=./models/classifier.engine
+export MILVUS_HOST=127.0.0.1
+export OPENAI_API_KEY=...
+```
+
+Run:
+
+```bash
+chmod +x run_pipeline.sh
+./run_pipeline.sh
+```
+
 Endpoint:
 
 ```bash
@@ -221,6 +240,7 @@ Build or provide an application image first, then run Compose:
 ```bash
 export OPENSDI_IMAGE=opensdi:latest
 export MILVUS_HOST=milvus
+export DEDUP_ENGINE_PATH=/models/dedup.engine
 export CLASSIFIER_ENGINE_PATH=/models/classifier.engine
 export OPENAI_API_KEY=...
 docker compose up -d
@@ -289,5 +309,5 @@ registry secret, then attach that secret to the workload image pull settings.
 
 - `main.py` is intentionally small and keeps only LitServe API/server wiring.
 - Dedup business logic lives under `src/`.
-- TensorRT runtime needs `tensorrt` and `pycuda` available inside the server environment.
+- TensorRT runtime needs `tensorrt` and `cuda.bindings` available inside the server environment.
 - This repo does not include Milvus or TensorRT Docker images; run those separately.
