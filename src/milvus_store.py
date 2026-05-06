@@ -23,7 +23,7 @@ except Exception:
     ConnectionNotExistException = MilvusException
 
 
-logger = logging.getLogger("image-dedup-litserve")
+logger = logging.getLogger("pipeline-litserve")
 
 
 class MilvusDedupStore:
@@ -45,14 +45,18 @@ class MilvusDedupStore:
             except Exception:
                 pass
 
-            connections.connect(
-                alias="default",
-                host=self.cfg.milvus_host,
-                port=self.cfg.milvus_port,
-            )
+            connect_kwargs: dict[str, Any] = {
+                "alias": "default",
+                "host": self.cfg.milvus_host,
+                "port": self.cfg.milvus_port,
+            }
+            if self.cfg.milvus_database:
+                connect_kwargs["db_name"] = self.cfg.milvus_database
 
-            if utility.has_collection(self.cfg.collection_name):
-                collection = Collection(self.cfg.collection_name)
+            connections.connect(**connect_kwargs)
+
+            if utility.has_collection(self.cfg.collection_name, using="default"):
+                collection = Collection(self.cfg.collection_name, using="default")
                 collection.load()
                 self.collection = collection
                 self._wait_for_collection_loaded()
@@ -67,7 +71,7 @@ class MilvusDedupStore:
     def health(self) -> bool:
         return bool(
             self.with_retry(
-                lambda: utility.has_collection(self.cfg.collection_name),
+                lambda: utility.has_collection(self.cfg.collection_name, using="default"),
                 op_name="health_check",
                 retries=1,
             )
@@ -76,40 +80,30 @@ class MilvusDedupStore:
     def num_entities(self) -> int:
         return int(self._require_collection().num_entities)
 
-    def query_existing_hashes(
-        self,
-        hashes: list[str],
-    ) -> dict[str, dict[str, str]]:
+    def query_existing_hashes(self, hashes: list[str]) -> dict[str, dict[str, str]]:
         collection = self._require_collection()
-        hashes = sorted(set(h for h in hashes if h))
-        if not hashes:
+        unique_hashes = sorted(set(h for h in hashes if h))
+        if not unique_hashes:
             return {}
 
         found: dict[str, dict[str, str]] = {}
         chunk_size = 100
-
-        for i in range(0, len(hashes), chunk_size):
-            chunk = hashes[i : i + chunk_size]
+        for i in range(0, len(unique_hashes), chunk_size):
+            chunk = unique_hashes[i : i + chunk_size]
             quoted = ",".join(f'"{h}"' for h in chunk)
-            expr = f"image_sha256 in [{quoted}]"
-
+            expr = f'image_sha256 in [{quoted}]'
             rows = collection.query(
                 expr=expr,
                 output_fields=["image_id", "image_sha256"],
             )
-
             for row in rows:
                 found[row["image_sha256"]] = {
                     "image_id": row["image_id"],
                     "image_sha256": row["image_sha256"],
                 }
-
         return found
 
-    def search_nearest_batch(
-        self,
-        vectors: np.ndarray,
-    ) -> list[dict[str, Any] | None]:
+    def search_nearest_batch(self, vectors: np.ndarray) -> list[dict[str, Any] | None]:
         if len(vectors) == 0:
             return []
 
@@ -119,9 +113,7 @@ class MilvusDedupStore:
             anns_field="vector",
             param={
                 "metric_type": "IP",
-                "params": {
-                    "ef": self.cfg.search_ef,
-                },
+                "params": {"ef": self.cfg.search_ef},
             },
             limit=1,
             output_fields=["image_id", "image_sha256"],
@@ -142,13 +134,12 @@ class MilvusDedupStore:
                     "cosine_similarity": float(hit.score),
                 }
             )
-
         return nearest_items
 
     def insert_accepted(
         self,
         accepted: list[dict[str, Any]],
-        flat_results: list[dict[str, Any] | None],
+        results: list[dict[str, Any] | None],
     ) -> None:
         collection = self._require_collection()
         existing_by_hash = self.query_existing_hashes([x["sha256"] for x in accepted])
@@ -160,7 +151,7 @@ class MilvusDedupStore:
 
             if existing:
                 if existing["image_id"] == row["image_id"]:
-                    flat_results[flat_idx] = {
+                    results[flat_idx] = {
                         "image_id": row["image_id"],
                         "status": "unique",
                         "sha256": row["sha256"],
@@ -168,7 +159,7 @@ class MilvusDedupStore:
                         "already_existed_after_retry": True,
                     }
                 else:
-                    flat_results[flat_idx] = {
+                    results[flat_idx] = {
                         "image_id": row["image_id"],
                         "status": "duplicate",
                         "duplicate_type": "exact_sha256_race_or_retry",
@@ -188,26 +179,18 @@ class MilvusDedupStore:
         image_hashes = [x["sha256"] for x in rows_to_insert]
         vectors = np.stack([x["vector"] for x in rows_to_insert]).astype(np.float32)
 
-        mutation_result = collection.insert(
-            [
-                image_ids,
-                image_hashes,
-                vectors.tolist(),
-            ]
-        )
-
+        mutation_result = collection.insert([image_ids, image_hashes, vectors.tolist()])
         if self.cfg.flush_on_insert:
             collection.flush()
 
         primary_keys = getattr(mutation_result, "primary_keys", None) or []
-
         for idx, row in enumerate(rows_to_insert):
             flat_idx = row["flat_idx"]
-            result = flat_results[flat_idx] or {}
+            result = results[flat_idx] or {}
             result["inserted"] = True
             if idx < len(primary_keys):
                 result["milvus_id"] = int(primary_keys[idx])
-            flat_results[flat_idx] = result
+            results[flat_idx] = result
 
     def with_retry(
         self,
@@ -227,14 +210,12 @@ class MilvusDedupStore:
 
                 self.last_error = repr(exc)
                 self.recovered_this_predict += 1
-
                 logger.exception(
                     "Milvus op failed: %s. Reconnecting. attempt=%s/%s",
                     op_name,
                     attempt + 1,
                     retries,
                 )
-
                 time.sleep(delay)
                 delay = min(delay * 2, 30.0)
                 self.connect_and_prepare_collection()
@@ -243,53 +224,34 @@ class MilvusDedupStore:
 
     def _create_collection(self) -> Collection:
         fields = [
-            FieldSchema(
-                name="id",
-                dtype=DataType.INT64,
-                is_primary=True,
-                auto_id=True,
-            ),
-            FieldSchema(
-                name="image_id",
-                dtype=DataType.VARCHAR,
-                max_length=2048,
-            ),
-            FieldSchema(
-                name="image_sha256",
-                dtype=DataType.VARCHAR,
-                max_length=128,
-            ),
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema(name="image_id", dtype=DataType.VARCHAR, max_length=2048),
+            FieldSchema(name="image_sha256", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(
                 name="vector",
                 dtype=DataType.FLOAT_VECTOR,
-                dim=self.cfg.dim,
+                dim=self.cfg.dedup_embedding_dim or 384,
             ),
         ]
 
         schema = CollectionSchema(
             fields=fields,
-            description="Base64 image dedup collection",
+            description="Triton embedding image dedup collection",
         )
 
         collection = Collection(
             name=self.cfg.collection_name,
             schema=schema,
+            using="default",
         )
-
-        index_params = {
-            "metric_type": "IP",
-            "index_type": "HNSW",
-            "params": {
-                "M": 16,
-                "efConstruction": 200,
-            },
-        }
-
         collection.create_index(
             field_name="vector",
-            index_params=index_params,
+            index_params={
+                "metric_type": "IP",
+                "index_type": "HNSW",
+                "params": {"M": 16, "efConstruction": 200},
+            },
         )
-
         collection.load()
         self._wait_for_collection_loaded()
         return collection
@@ -299,6 +261,7 @@ class MilvusDedupStore:
             utility.wait_for_loading_complete(
                 collection_name=self.cfg.collection_name,
                 timeout=self.cfg.milvus_load_timeout,
+                using="default",
             )
         except AttributeError:
             pass

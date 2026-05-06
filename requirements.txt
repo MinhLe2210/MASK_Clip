@@ -1,21 +1,8 @@
-# Core API services
 litserve
 python-dotenv
-starlette
 requests
 openai
 numpy
 Pillow
 pymilvus==2.3.14
-
-# TensorRT runtime
-# If your environment uses a CUDA-specific TensorRT wheel, replace `tensorrt`
-# with the matching variant, for example `tensorrt-cu12`.
-tensorrt-cu13
-cuda-python
-
-# ONNX export / verification utilities
-torch==2.11
-transformers
-onnx
-onnxruntime
+tritonclient[http]

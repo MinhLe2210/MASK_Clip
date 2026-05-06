@@ -10,14 +10,27 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def decode_base64_to_bytes(image_base64: str) -> bytes:
-    if "," in image_base64 and image_base64.lower().startswith("data:"):
-        image_base64 = image_base64.split(",", 1)[1]
+    value = image_base64.strip()
+    if "," in value and value.lower().startswith("data:"):
+        value = value.split(",", 1)[1]
 
     try:
-        return base64.b64decode(image_base64, validate=True)
+        return base64.b64decode(value, validate=True)
     except binascii.Error:
-        compact = "".join(image_base64.split())
+        compact = "".join(value.split())
         return base64.b64decode(compact, validate=True)
+
+
+def load_url_bytes(url: str) -> bytes:
+    req = Request(url, headers={"User-Agent": "OpenSDI/1.0"})
+    with urlopen(req, timeout=30) as response:
+        return response.read()
+
+
+def bytes_from_ref(image_ref: str) -> bytes:
+    if image_ref.startswith(("http://", "https://")):
+        return load_url_bytes(image_ref)
+    return decode_base64_to_bytes(image_ref)
 
 
 def bytes_to_pil(image_bytes: bytes) -> Image.Image:
@@ -25,17 +38,13 @@ def bytes_to_pil(image_bytes: bytes) -> Image.Image:
         return img.convert("RGB").copy()
 
 
-def load_url_bytes(url: str) -> bytes:
-    req = Request(url, headers={"User-Agent": "OpenSDI/1.0"})
-    with urlopen(req, timeout=15) as response:
-        return response.read()
-
-
-def bytes_from_ref(image_ref: str) -> bytes:
-    if image_ref.startswith("http://") or image_ref.startswith("https://"):
-        return load_url_bytes(image_ref)
-    return decode_base64_to_bytes(image_ref)
-
-
 def image_from_ref(image_ref: str) -> Image.Image:
     return bytes_to_pil(bytes_from_ref(image_ref))
+
+
+def image_ref_for_openai(image_ref: str) -> str:
+    if image_ref.startswith(("http://", "https://")):
+        return image_ref
+    if image_ref.startswith("data:image/"):
+        return image_ref
+    return f"data:image/jpeg;base64,{image_ref}"

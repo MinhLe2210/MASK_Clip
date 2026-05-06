@@ -1,106 +1,62 @@
 services:
-  dedup:
-    image: ${OPENSDI_IMAGE:-opensdi:latest}
-    container_name: opensdi-dedup
-    working_dir: /app
-    command: python main.py
-    ports:
-      - "${DEDUP_PORT:-8000}:8000"
-    environment:
-      HOST: 0.0.0.0
-      PORT: 8000
-      MODEL_PATH: ${MODEL_PATH:-/models/dedup.engine}
-      DEDUP_ENGINE_PATH: ${DEDUP_ENGINE_PATH:-/models/dedup.engine}
-      EMBED_DIM: ${EMBED_DIM:-384}
-      DUP_THRESHOLD: ${DUP_THRESHOLD:-0.999995}
-      COLLECTION_NAME: ${COLLECTION_NAME:-AI_detector_image_dedup_b64}
-      MILVUS_HOST: ${MILVUS_HOST:-milvus}
-      MILVUS_PORT: ${MILVUS_PORT:-19530}
-      LITSERVE_ACCELERATOR: ${DEDUP_LITSERVE_ACCELERATOR:-gpu}
-      LITSERVE_DEVICES: ${DEDUP_LITSERVE_DEVICES:-1}
-      LITSERVE_WORKERS_PER_DEVICE: ${DEDUP_WORKERS_PER_DEVICE:-1}
-      LITSERVE_MAX_BATCH_SIZE: 32
-      LITSERVE_BATCH_TIMEOUT: ${DEDUP_BATCH_TIMEOUT:-0.05}
-      LITSERVE_REQUEST_TIMEOUT: ${DEDUP_REQUEST_TIMEOUT:-120}
-      LITSERVE_MAX_PAYLOAD_SIZE: ${DEDUP_MAX_PAYLOAD_SIZE:-100MB}
-      MAX_IMAGES_PER_REQUEST: ${DEDUP_MAX_IMAGES_PER_REQUEST:-64}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    volumes:
-      - ./:/app
-      - ${MODEL_DIR:-./models}:/models:ro
-    cpus: "1.0"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  triton:
+    image: nvcr.io/nvidia/tritonserver:25.08-py3
+    container_name: opensdi-triton
     restart: unless-stopped
-
-  classification:
-    image: ${OPENSDI_IMAGE:-opensdi:latest}
-    container_name: opensdi-classification
-    working_dir: /app
-    command: python classification_server.py
     ports:
-      - "${CLASSIFIER_PORT:-8001}:8001"
-    environment:
-      HOST: 0.0.0.0
-      CLASSIFIER_PORT: 8001
-      CLASSIFIER_ENGINE_PATH: ${CLASSIFIER_ENGINE_PATH:-/models/classifier.engine}
-      CLASSIFIER_INPUT_NAME: ${CLASSIFIER_INPUT_NAME:-input}
-      CLASSIFIER_OUTPUT_NAME: ${CLASSIFIER_OUTPUT_NAME:-output}
-      CLASSIFIER_LABELS: ${CLASSIFIER_LABELS:-negative,positive}
-      CLASSIFIER_BATCH_SIZE: 16
-      CLASSIFIER_BATCH_TIMEOUT: ${CLASSIFIER_BATCH_TIMEOUT:-0.05}
-      CLASSIFIER_INPUT_SIZE: ${CLASSIFIER_INPUT_SIZE:-384}
-      MAX_IMAGES_PER_REQUEST: ${CLASSIFIER_MAX_IMAGES_PER_REQUEST:-16}
-      LITSERVE_ACCELERATOR: ${CLASSIFIER_LITSERVE_ACCELERATOR:-gpu}
-      LITSERVE_DEVICES: ${CLASSIFIER_LITSERVE_DEVICES:-1}
-      LITSERVE_WORKERS_PER_DEVICE: ${CLASSIFIER_WORKERS_PER_DEVICE:-1}
-      LITSERVE_REQUEST_TIMEOUT: ${CLASSIFIER_REQUEST_TIMEOUT:-120}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      - "${TRITON_HTTP_PORT:-30000}:8000"
+      - "${TRITON_GRPC_PORT:-30001}:8001"
+      - "${TRITON_METRICS_PORT:-30002}:8002"
     volumes:
-      - ./:/app
-      - ${MODEL_DIR:-./models}:/models:ro
-    cpus: "1.0"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    restart: unless-stopped
+      - ./model_repository:/models
+    gpus:
+      - driver: nvidia
+        device_ids: ["${TRITON_GPU_ID:-0}"]
+    command: >
+      tritonserver
+      --model-repository=/models
+      --log-verbose=1
+      --strict-model-config=false
 
   pipeline:
-    image: ${OPENSDI_IMAGE:-opensdi:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: opensdi-pipeline
-    working_dir: /app
-    command: python pipeline_server.py
+    restart: unless-stopped
+    depends_on:
+      - triton
     ports:
       - "${PIPELINE_PORT:-8002}:8002"
     environment:
       HOST: 0.0.0.0
       PIPELINE_PORT: 8002
-      DEDUP_API_URL: http://dedup:8000/dedup
-      CLASSIFIER_API_URL: http://classification:8001/classify
+      TRITON_URL: ${TRITON_URL:-http://triton:8000}
+      DEDUP_MODEL_NAME: ${DEDUP_MODEL_NAME:-dedup_embedder}
+      DEDUP_INPUT_NAME: ${DEDUP_INPUT_NAME:-pixel_values}
+      DEDUP_OUTPUT_NAME: ${DEDUP_OUTPUT_NAME:-features}
+      DEDUP_IMAGE_SIZE: ${DEDUP_IMAGE_SIZE:-384}
+      EMBED_DIM: ${EMBED_DIM:-384}
+      CLASSIFIER_MODEL_NAME: ${CLASSIFIER_MODEL_NAME:-AI_images_detector}
+      CLASSIFIER_INPUT_NAME: ${CLASSIFIER_INPUT_NAME:-pixel_values}
+      CLASSIFIER_OUTPUT_NAME: ${CLASSIFIER_OUTPUT_NAME:-logits}
+      CLASSIFIER_LABELS: ${CLASSIFIER_LABELS:-fake,real}
+      CLASSIFIER_INPUT_SIZE: ${CLASSIFIER_INPUT_SIZE:-384}
+      COLLECTION_NAME: ${COLLECTION_NAME:-ai_detector_images_deduplicate}
+      MILVUS_HOST: ${MILVUS_HOST}
+      MILVUS_PORT: ${MILVUS_PORT:-19530}
+      MILVUS_DATABASE: ${MILVUS_DATABASE:-default}
+      DUP_THRESHOLD: ${DUP_THRESHOLD:-0.999995}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_VLM_MODEL: ${OPENAI_VLM_MODEL:-gpt-5-mini}
       OPENAI_PROXY: ${OPENAI_PROXY:-}
       OPENAI_TIMEOUT: ${OPENAI_TIMEOUT:-60}
-      PIPELINE_REQUEST_TIMEOUT: ${PIPELINE_REQUEST_TIMEOUT:-60}
-      PIPELINE_BATCH_SIZE: ${PIPELINE_BATCH_SIZE:-1}
+      PIPELINE_REQUEST_TIMEOUT: ${PIPELINE_REQUEST_TIMEOUT:-120}
+      PIPELINE_BATCH_SIZE: ${PIPELINE_BATCH_SIZE:-8}
+      PIPELINE_BATCH_TIMEOUT: ${PIPELINE_BATCH_TIMEOUT:-0.05}
+      LITSERVE_MAX_PAYLOAD_SIZE: ${LITSERVE_MAX_PAYLOAD_SIZE:-100MB}
       LITSERVE_ACCELERATOR: cpu
       LITSERVE_DEVICES: 1
-      LITSERVE_WORKERS_PER_DEVICE: ${PIPELINE_WORKERS_PER_DEVICE:-1}
-      LITSERVE_REQUEST_TIMEOUT: ${PIPELINE_LITSERVE_REQUEST_TIMEOUT:-180}
+      LITSERVE_WORKERS_PER_DEVICE: ${LITSERVE_WORKERS_PER_DEVICE:-1}
+      LITSERVE_REQUEST_TIMEOUT: ${LITSERVE_REQUEST_TIMEOUT:-180}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    volumes:
-      - ./:/app
-    cpus: "1.0"
-    depends_on:
-      - dedup
-      - classification
-    restart: unless-stopped

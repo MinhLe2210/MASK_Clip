@@ -22,7 +22,7 @@ def image_file_to_data_url(path: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Client for dedup -> TensorRT classification -> OpenAI VLM pipeline."
+        description="Client for Triton dedup -> Triton classification -> OpenAI pipeline."
     )
     parser.add_argument(
         "--url",
