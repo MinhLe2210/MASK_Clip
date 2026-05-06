@@ -1,0 +1,21 @@
+# Core API services
+litserve
+python-dotenv
+starlette
+requests
+openai
+numpy
+Pillow
+pymilvus
+
+# TensorRT runtime
+# If your environment uses a CUDA-specific TensorRT wheel, replace `tensorrt`
+# with the matching variant, for example `tensorrt-cu12`.
+tensorrt
+cuda-python
+
+# ONNX export / verification utilities
+torch
+transformers
+onnx
+onnxruntime
