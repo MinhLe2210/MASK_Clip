@@ -35,10 +35,10 @@ class PipelineSettings:
     @classmethod
     def from_env(cls) -> "PipelineSettings":
         return cls(
-            dedup_api_url=os.getenv("DEDUP_API_URL", "http://dedup:8000/dedup"),
+            dedup_api_url=os.getenv("DEDUP_API_URL", "http://127.0.0.1:8000/dedup"),
             classifier_api_url=os.getenv(
                 "CLASSIFIER_API_URL",
-                "http://classification:8001/classify",
+                "http://127.0.0.1:8001/classify",
             ),
             openai_model=os.getenv("OPENAI_VLM_MODEL", "gpt-5-mini"),
             openai_proxy=os.getenv("OPENAI_PROXY") or None,
