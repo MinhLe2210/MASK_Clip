@@ -181,12 +181,6 @@ class DedupService:
                 "inserted": False,
             }
 
-        if accepted:
-            self.store.with_retry(
-                lambda: self.store.insert_accepted(accepted, results),
-                op_name="insert_accepted",
-            )
-
         return [
             record
             for record in accepted

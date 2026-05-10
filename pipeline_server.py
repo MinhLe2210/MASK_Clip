@@ -303,7 +303,7 @@ def run_pipeline_on_items(
     openai_total_elapsed = 0.0
     cached_payload_by_image_id: dict[str, dict[str, Any]] = {}
     cached_payload_by_sha256: dict[str, dict[str, Any]] = {}
-    cache_rows_to_persist: dict[str, dict[str, Any]] = {}
+    processed_rows_to_insert: dict[str, dict[str, Any]] = {}
 
     pipeline_results: list[dict[str, Any]] = []
     for idx, (item, dedup_result) in enumerate(zip(items, dedup_results)):
@@ -400,7 +400,6 @@ def run_pipeline_on_items(
                             cached_payload_by_image_id[str(matched_image_id)] = cached_payload
                         cached_payload_by_image_id[item["image_id"]] = cached_payload
                         cached_payload_by_sha256[matched_sha256] = cached_payload
-                        cache_rows_to_persist[matched_sha256] = cached_payload
                 except Exception as exc:
                     logger.exception(
                         "Duplicate cache rebuild failed: image_id=%s matched_image_id=%s matched_sha256=%s",
@@ -481,7 +480,18 @@ def run_pipeline_on_items(
             if cached_payload and dedup_result.get("sha256"):
                 cached_payload_by_image_id[item["image_id"]] = cached_payload
                 cached_payload_by_sha256[dedup_result["sha256"]] = cached_payload
-                cache_rows_to_persist[dedup_result["sha256"]] = cached_payload
+                record = unique_by_flat_idx[idx]
+                processed_rows_to_insert[dedup_result["sha256"]] = {
+                    "flat_idx": idx,
+                    "image_id": item["image_id"],
+                    "sha256": dedup_result["sha256"],
+                    "vector": record["vector"],
+                    "pipeline_stage": "classification",
+                    "classification": classification,
+                    "vlm": None,
+                    "openai_skipped": True,
+                    "skip_reason": "classification_label_is_not_fake",
+                }
             continue
 
         record = unique_by_flat_idx[idx]
@@ -540,7 +550,17 @@ def run_pipeline_on_items(
         if cached_payload and dedup_result.get("sha256"):
             cached_payload_by_image_id[item["image_id"]] = cached_payload
             cached_payload_by_sha256[dedup_result["sha256"]] = cached_payload
-            cache_rows_to_persist[dedup_result["sha256"]] = cached_payload
+            processed_rows_to_insert[dedup_result["sha256"]] = {
+                "flat_idx": idx,
+                "image_id": item["image_id"],
+                "sha256": dedup_result["sha256"],
+                "vector": record["vector"],
+                "pipeline_stage": "openai",
+                "classification": classification,
+                "vlm": vlm_result,
+                "openai_skipped": False,
+                "skip_reason": None,
+            }
 
     if openai_call_count:
         logger.info(
@@ -552,12 +572,13 @@ def run_pipeline_on_items(
     else:
         logger.info("OpenAI VLM summary: calls=0 total_elapsed_seconds=0.0000")
 
-    if cache_rows_to_persist:
+    if processed_rows_to_insert:
         runtime.dedup_service.store.with_retry(
-            lambda: runtime.dedup_service.store.insert_result_cache(
-                list(cache_rows_to_persist.values())
+            lambda: runtime.dedup_service.store.insert_processed_images(
+                list(processed_rows_to_insert.values()),
+                dedup_results,
             ),
-            op_name="insert_result_cache",
+            op_name="insert_processed_images",
         )
 
     return pipeline_results

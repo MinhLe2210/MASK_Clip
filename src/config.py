@@ -86,7 +86,6 @@ class Settings:
     vlm_prompt: str
 
     collection_name: str
-    result_cache_collection_name: str
     milvus_host: str
     milvus_port: str
     milvus_database: str | None
@@ -154,10 +153,6 @@ class Settings:
             ),
             vlm_prompt=load_openai_prompt(),
             collection_name=collection_name,
-            result_cache_collection_name=_required_env(
-                "RESULT_CACHE_COLLECTION_NAME",
-                f"{collection_name}_results",
-            ),
             milvus_host=_required_env("MILVUS_HOST"),
             milvus_port=_required_env("MILVUS_PORT", "19530"),
             milvus_database=_optional_env("MILVUS_DATABASE", "DATABASE"),
