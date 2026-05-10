@@ -1,19 +1,24 @@
 import argparse
 import hashlib
 import json
+import traceback
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from pymilvus import Collection, connections, utility
+from pymilvus import Collection, connections
 
 from src.config import Settings
+from src.milvus_store import MilvusDedupStore
 from src.triton_clients import TritonEmbeddingClient
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect one local image against Milvus dedup collection."
+        description=(
+            "Inspect one local image against Milvus, optionally insert one dummy "
+            "row from its embedding, then test dedup behavior."
+        )
     )
     parser.add_argument(
         "--image",
@@ -26,28 +31,35 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of nearest Milvus hits to print. Default: 3",
     )
+    parser.add_argument(
+        "--insert-dummy",
+        action="store_true",
+        help="Insert one dummy row into Milvus using the image embedding.",
+    )
+    parser.add_argument(
+        "--dummy-match",
+        choices=["vector", "exact"],
+        default="vector",
+        help=(
+            "Dummy insert mode. 'vector' keeps the same embedding but uses a different "
+            "sha256 so vector dedup can be tested. 'exact' uses the real sha256."
+        ),
+    )
+    parser.add_argument(
+        "--dummy-image-id",
+        default=None,
+        help="Optional custom image_id for the dummy row.",
+    )
+    parser.add_argument(
+        "--cleanup-dummy",
+        action="store_true",
+        help="Delete the inserted dummy row at the end of the script.",
+    )
     return parser.parse_args()
 
 
-def connect_milvus(cfg: Settings) -> None:
-    try:
-        connections.disconnect(alias="default")
-    except Exception:
-        pass
-
-    connect_kwargs: dict[str, Any] = {
-        "alias": "default",
-        "host": cfg.milvus_host,
-        "port": cfg.milvus_port,
-    }
-    if cfg.milvus_database:
-        connect_kwargs["db_name"] = cfg.milvus_database
-    connections.connect(**connect_kwargs)
-
-
-def compute_sha256(path: Path) -> tuple[str, bytes]:
-    image_bytes = path.read_bytes()
-    return hashlib.sha256(image_bytes).hexdigest(), image_bytes
+def compute_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def pretty_type(field: Any) -> str:
@@ -115,7 +127,7 @@ def print_schema(collection: Collection) -> set[str]:
     return field_names
 
 
-def query_exact_hash(
+def query_hash_rows(
     collection: Collection,
     sha256: str,
     field_names: set[str],
@@ -128,16 +140,24 @@ def query_exact_hash(
     return [simplify_row(dict(row)) for row in rows]
 
 
-def search_nearest(
+def print_hash_query(
     collection: Collection,
-    cfg: Settings,
-    image_path: Path,
-    topk: int,
+    sha256: str,
     field_names: set[str],
+    title: str,
 ) -> list[dict[str, Any]]:
-    from PIL import Image
+    print(f"=== {title} ===")
+    rows = query_hash_rows(collection, sha256, field_names)
+    if rows:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    else:
+        print("no rows")
+    print()
+    return rows
 
-    embedder = TritonEmbeddingClient(
+
+def load_embedder(cfg: Settings) -> TritonEmbeddingClient:
+    return TritonEmbeddingClient(
         url=cfg.triton_client_url,
         model_name=cfg.dedup_model_name,
         input_name=cfg.dedup_input_name,
@@ -147,13 +167,26 @@ def search_nearest(
         timeout=cfg.request_timeout,
     )
 
+
+def embed_local_image(cfg: Settings, image_path: Path) -> Any:
+    from PIL import Image
+
+    embedder = load_embedder(cfg)
     with Image.open(image_path) as img:
         image = img.convert("RGB").copy()
+    return embedder.embed([image])[0]
 
-    vector = embedder.embed([image])
+
+def search_nearest(
+    collection: Collection,
+    cfg: Settings,
+    vector: Any,
+    topk: int,
+    field_names: set[str],
+) -> list[dict[str, Any]]:
     output_fields = build_query_output_fields(field_names)
     results = collection.search(
-        data=vector.astype("float32").tolist(),
+        data=[vector.astype("float32").tolist()],
         anns_field="vector",
         param={
             "metric_type": "IP",
@@ -177,6 +210,125 @@ def search_nearest(
     return hits
 
 
+def build_dummy_sha256(actual_sha256: str, mode: str) -> str:
+    if mode == "exact":
+        return actual_sha256
+    return hashlib.sha256(f"debug-vector::{actual_sha256}".encode("utf-8")).hexdigest()
+
+
+def build_dummy_image_id(actual_sha256: str, mode: str, custom_image_id: str | None) -> str:
+    if custom_image_id:
+        return custom_image_id
+    return f"debug:{mode}:{actual_sha256[:16]}"
+
+
+def build_dummy_row(
+    cfg: Settings,
+    actual_sha256: str,
+    vector: Any,
+    mode: str,
+    custom_image_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    labels = cfg.classification_labels or ["fake", "real"]
+    primary_label = "fake" if "fake" in labels else labels[0]
+    secondary_labels = [label for label in labels if label != primary_label]
+    scores = {label: 0.0 for label in labels}
+    scores[primary_label] = 1.0
+    for label in secondary_labels:
+        scores[label] = 0.0
+
+    dummy_sha256 = build_dummy_sha256(actual_sha256, mode)
+    dummy_image_id = build_dummy_image_id(actual_sha256, mode, custom_image_id)
+    classification = {
+        "status": "classified",
+        "backend": "debug_script",
+        "label": primary_label,
+        "class_index": labels.index(primary_label),
+        "confidence": 1.0,
+        "logits": [1.0 if label == primary_label else 0.0 for label in labels],
+        "scores": scores,
+    }
+
+    row = {
+        "flat_idx": 0,
+        "image_id": dummy_image_id,
+        "sha256": dummy_sha256,
+        "vector": vector,
+        "pipeline_stage": "classification",
+        "classification": classification,
+        "vlm": None,
+        "openai_skipped": True,
+        "skip_reason": "debug_dummy_insert",
+    }
+    result = {
+        "image_id": dummy_image_id,
+        "status": "unique",
+        "sha256": dummy_sha256,
+        "inserted": False,
+    }
+    return row, result
+
+
+def insert_dummy_row(
+    store: MilvusDedupStore,
+    collection: Collection,
+    field_names: set[str],
+    cfg: Settings,
+    actual_sha256: str,
+    vector: Any,
+    mode: str,
+    custom_image_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    row, result = build_dummy_row(cfg, actual_sha256, vector, mode, custom_image_id)
+    results = [result]
+
+    print("=== Dummy Insert Plan ===")
+    print(
+        json.dumps(
+            {
+                "image_id": row["image_id"],
+                "dummy_match": mode,
+                "actual_sha256": actual_sha256,
+                "insert_sha256": row["sha256"],
+                "pipeline_stage": row["pipeline_stage"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    print()
+
+    existing_dummy = query_hash_rows(collection, row["sha256"], field_names)
+    if existing_dummy:
+        print("=== Dummy Row Already Exists ===")
+        print(json.dumps(existing_dummy, ensure_ascii=False, indent=2))
+        print()
+        return row, results[0]
+
+    print("=== Dummy Insert Attempt ===")
+    try:
+        store.insert_processed_images([row], results)
+        print("insert ok")
+        print(json.dumps(results[0], ensure_ascii=False, indent=2))
+        print()
+        return row, results[0]
+    except Exception as exc:
+        print("insert failed")
+        print(repr(exc))
+        print()
+        traceback.print_exc()
+        print()
+        return None
+
+
+def cleanup_dummy_row(collection: Collection, sha256: str) -> None:
+    print("=== Cleanup Dummy Row ===")
+    result = collection.delete(expr=f'image_sha256 in ["{sha256}"]')
+    print(f"delete expr sha256={sha256}")
+    print(f"delete result: {result}")
+    print()
+
+
 def main() -> None:
     load_dotenv()
     args = parse_args()
@@ -185,37 +337,57 @@ def main() -> None:
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     cfg = Settings.from_env()
-    connect_milvus(cfg)
+    store = MilvusDedupStore(cfg)
+    collection = store.connect_and_prepare_collection()
+    field_names = print_schema(collection)
 
-    if not utility.has_collection(cfg.collection_name, using="default"):
-        raise RuntimeError(f"Milvus collection not found: {cfg.collection_name}")
-
-    collection = Collection(cfg.collection_name, using="default")
-    collection.load()
-
-    sha256, _ = compute_sha256(image_path)
+    actual_sha256 = compute_sha256(image_path)
+    vector = embed_local_image(cfg, image_path)
 
     print("=== Image ===")
     print(f"path: {image_path}")
-    print(f"sha256: {sha256}")
+    print(f"sha256: {actual_sha256}")
+    print(f"embedding_dim: {len(vector)}")
     print()
 
-    field_names = print_schema(collection)
+    print_hash_query(
+        collection=collection,
+        sha256=actual_sha256,
+        field_names=field_names,
+        title="Exact SHA256 Query Before Insert",
+    )
 
-    print("=== Exact SHA256 Query ===")
-    exact_rows = query_exact_hash(collection, sha256, field_names)
-    if exact_rows:
-        print(json.dumps(exact_rows, ensure_ascii=False, indent=2))
-    else:
-        print("no exact hash match")
-    print()
+    inserted_row = None
+    if args.insert_dummy:
+        inserted_row = insert_dummy_row(
+            store=store,
+            collection=collection,
+            field_names=field_names,
+            cfg=cfg,
+            actual_sha256=actual_sha256,
+            vector=vector,
+            mode=args.dummy_match,
+            custom_image_id=args.dummy_image_id,
+        )
+        if inserted_row is not None:
+            dummy_row, _ = inserted_row
+            print_hash_query(
+                collection=collection,
+                sha256=dummy_row["sha256"],
+                field_names=field_names,
+                title="Dummy SHA256 Query After Insert",
+            )
 
     print("=== Nearest Vector Search ===")
-    nearest_hits = search_nearest(collection, cfg, image_path, args.topk, field_names)
+    nearest_hits = search_nearest(collection, cfg, vector, args.topk, field_names)
     if nearest_hits:
         print(json.dumps(nearest_hits, ensure_ascii=False, indent=2))
     else:
         print("no nearest hits")
+    print()
+
+    if args.insert_dummy and inserted_row is not None and args.cleanup_dummy:
+        cleanup_dummy_row(collection, inserted_row[0]["sha256"])
 
     try:
         connections.disconnect(alias="default")
