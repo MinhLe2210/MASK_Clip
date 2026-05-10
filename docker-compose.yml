@@ -1,7 +1,7 @@
 services:
   triton:
     image: nvcr.io/nvidia/tritonserver:25.08-py3
-    container_name: opensdi-triton
+    container_name: ai-detector-triton
     restart: unless-stopped
     ports:
       - "${TRITON_HTTP_PORT:-30000}:8000"
@@ -19,10 +19,15 @@ services:
       --strict-model-config=false
 
   pipeline:
+    image: ai-detector-pipeline:latest
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: opensdi-pipeline
+      network: host
+      secrets:
+        - pip_conf
+        - apt_conf
+    container_name: ai-detector-pipeline
     restart: unless-stopped
     depends_on:
       - triton
@@ -44,11 +49,11 @@ services:
       CLASSIFIER_INPUT_SIZE: ${CLASSIFIER_INPUT_SIZE:-384}
       COLLECTION_NAME: ${COLLECTION_NAME:-ai_detector_images_deduplicate}
       MILVUS_HOST: ${MILVUS_HOST}
-      MILVUS_PORT: ${MILVUS_PORT:-19530}
+      MILVUS_PORT: ${MILVUS_PORT:-30865}
       MILVUS_DATABASE: ${MILVUS_DATABASE:-default}
       DUP_THRESHOLD: ${DUP_THRESHOLD:-0.999995}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_VLM_MODEL: ${OPENAI_VLM_MODEL:-gpt-5-mini}
+      OPENAI_VLM_MODEL: ${OPENAI_VLM_MODEL:-gpt-5.4-mini}
       OPENAI_PROXY: ${OPENAI_PROXY:-}
       OPENAI_TIMEOUT: ${OPENAI_TIMEOUT:-60}
       PIPELINE_REQUEST_TIMEOUT: ${PIPELINE_REQUEST_TIMEOUT:-120}
@@ -60,3 +65,10 @@ services:
       LITSERVE_WORKERS_PER_DEVICE: ${LITSERVE_WORKERS_PER_DEVICE:-1}
       LITSERVE_REQUEST_TIMEOUT: ${LITSERVE_REQUEST_TIMEOUT:-180}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+
+secrets:
+  pip_conf:
+    file: ${HOME}/.config/pip/pip.conf
+  apt_conf:
+    file: /etc/apt/apt.conf

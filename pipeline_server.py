@@ -1,17 +1,14 @@
-import json
 import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
-import litserve as ls
 from dotenv import load_dotenv
-
-try:
-    from litserve.callbacks import Callback
-except Exception:
-    from litserve.callbacks.base import Callback
+from fastapi import FastAPI, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from src.config import Settings
 from src.dedup_service import DedupService
@@ -23,15 +20,7 @@ from src.triton_clients import TritonClassificationClient, TritonEmbeddingClient
 load_dotenv()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("pipeline-litserve")
-
-
-class PipelineCallback(Callback):
-    def on_server_start(self, *args, **kwargs):
-        logger.info("Triton pipeline LitServe server starting.")
-
-    def on_after_setup(self, *args, **kwargs):
-        logger.info("Triton pipeline worker setup completed.")
+logger = logging.getLogger("pipeline-fastapi")
 
 
 def normalize_images_payload(
@@ -105,6 +94,8 @@ class OpenAIVisionClient:
         prompt: str,
         classification: dict[str, Any],
     ) -> dict[str, Any]:
+        import json
+
         response = self.client.responses.create(
             model=self.model,
             input=[
@@ -136,298 +127,371 @@ class OpenAIVisionClient:
         }
 
 
-class TritonDedupClassificationOpenAIAPI(ls.LitAPI):
-    def __init__(self):
-        max_batch_size = int(
-            os.getenv(
-                "PIPELINE_BATCH_SIZE",
-                os.getenv("MAX_BATCH_SIZE", "8"),
+@dataclass
+class PipelineRuntime:
+    cfg: Settings
+    dedup_service: DedupService
+    classifier: TritonClassificationClient
+    openai_client: OpenAIVisionClient
+
+
+def build_runtime() -> PipelineRuntime:
+    cfg = Settings.from_env()
+
+    embedder = TritonEmbeddingClient(
+        url=cfg.triton_client_url,
+        model_name=cfg.dedup_model_name,
+        input_name=cfg.dedup_input_name,
+        output_name=cfg.dedup_output_name,
+        image_size=cfg.dedup_image_size,
+        embedding_dim=cfg.dedup_embedding_dim,
+        timeout=cfg.request_timeout,
+    )
+    cfg.dedup_embedding_dim = embedder.embedding_dim
+
+    classifier = TritonClassificationClient(
+        url=cfg.triton_client_url,
+        model_name=cfg.classification_model_name,
+        input_name=cfg.classification_input_name,
+        output_name=cfg.classification_output_name,
+        image_size=cfg.classification_image_size,
+        labels=cfg.classification_labels,
+        timeout=cfg.request_timeout,
+    )
+
+    store = MilvusDedupStore(cfg)
+    dedup_service = DedupService(
+        embedder=embedder,
+        store=store,
+        dup_threshold=cfg.dup_threshold,
+    )
+    dedup_service.prepare()
+
+    openai_client = OpenAIVisionClient(
+        model=cfg.openai_model,
+        timeout=cfg.openai_timeout,
+        proxy=cfg.openai_proxy,
+    )
+
+    return PipelineRuntime(
+        cfg=cfg,
+        dedup_service=dedup_service,
+        classifier=classifier,
+        openai_client=openai_client,
+    )
+
+
+def health(runtime: PipelineRuntime) -> bool:
+    try:
+        return (
+            runtime.dedup_service.health()
+            and runtime.classifier.is_ready()
+            and runtime.openai_client is not None
+        )
+    except Exception:
+        logger.exception("Health check failed.")
+        return False
+
+
+def is_fake_classification(classification: dict[str, Any]) -> bool:
+    """Return True only when Triton classification label is fake."""
+    label = classification.get("label")
+    return isinstance(label, str) and label.strip().lower() == "fake"
+
+
+# Patch đề xuất cho pipeline_server.py
+# Mục tiêu: log thời gian chạy riêng cho dedup, classification, và OpenAI VLM.
+# Ghi chú: OpenAI VLM chỉ được gọi khi classification label == fake.
+
+
+def run_pipeline_on_items(
+    runtime: PipelineRuntime,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    dedup_started = time.perf_counter()
+    dedup_results, unique_records = runtime.dedup_service.deduplicate(items)
+    dedup_elapsed = time.perf_counter() - dedup_started
+
+    logger.info(
+        "Dedup completed: total_images=%s unique_records=%s elapsed_seconds=%.4f",
+        len(items),
+        len(unique_records),
+        dedup_elapsed,
+    )
+
+    unique_by_flat_idx = {record["flat_idx"]: record for record in unique_records}
+
+    classification_by_flat_idx: dict[int, dict[str, Any]] = {}
+    if unique_records:
+        classification_started = time.perf_counter()
+        classify_results = runtime.classifier.classify([x["image"] for x in unique_records])
+        classification_elapsed = time.perf_counter() - classification_started
+
+        logger.info(
+            "Classification completed: unique_records=%s elapsed_seconds=%.4f avg_seconds_per_image=%.4f",
+            len(unique_records),
+            classification_elapsed,
+            classification_elapsed / len(unique_records),
+        )
+
+        for record, classify_result in zip(unique_records, classify_results):
+            classification_by_flat_idx[record["flat_idx"]] = classify_result
+    else:
+        logger.info("Classification skipped: unique_records=0")
+
+    openai_call_count = 0
+    openai_total_elapsed = 0.0
+
+    pipeline_results: list[dict[str, Any]] = []
+    for idx, (item, dedup_result) in enumerate(zip(items, dedup_results)):
+        if dedup_result.get("status") == "duplicate":
+            pipeline_results.append(
+                {
+                    "image_id": item["image_id"],
+                    "status": "skipped",
+                    "stage": "dedup",
+                    "dedup": dedup_result,
+                }
             )
-        )
-        batch_timeout = float(
-            os.getenv(
-                "PIPELINE_BATCH_TIMEOUT",
-                os.getenv("BATCH_TIMEOUT", "0.05"),
+            continue
+
+        if dedup_result.get("status") != "unique":
+            pipeline_results.append(
+                {
+                    "image_id": item["image_id"],
+                    "status": "error",
+                    "stage": "dedup",
+                    "dedup": dedup_result,
+                    "error": dedup_result.get("error"),
+                }
             )
-        )
+            continue
 
-        super().__init__(
-            api_path="/analyze",
-            max_batch_size=max_batch_size,
-            batch_timeout=batch_timeout,
-        )
-        self.cfg: Settings | None = None
-        self.dedup_service: DedupService | None = None
-        self.classifier: TritonClassificationClient | None = None
-        self.openai_client: OpenAIVisionClient | None = None
-
-    def setup(self, device):
-        self.cfg = Settings.from_env()
-
-        embedder = TritonEmbeddingClient(
-            url=self.cfg.triton_client_url,
-            model_name=self.cfg.dedup_model_name,
-            input_name=self.cfg.dedup_input_name,
-            output_name=self.cfg.dedup_output_name,
-            image_size=self.cfg.dedup_image_size,
-            embedding_dim=self.cfg.dedup_embedding_dim,
-            timeout=self.cfg.request_timeout,
-        )
-        self.cfg.dedup_embedding_dim = embedder.embedding_dim
-        classifier = TritonClassificationClient(
-            url=self.cfg.triton_client_url,
-            model_name=self.cfg.classification_model_name,
-            input_name=self.cfg.classification_input_name,
-            output_name=self.cfg.classification_output_name,
-            image_size=self.cfg.classification_image_size,
-            labels=self.cfg.classification_labels,
-            timeout=self.cfg.request_timeout,
-        )
-        store = MilvusDedupStore(self.cfg)
-        dedup_service = DedupService(
-            embedder=embedder,
-            store=store,
-            dup_threshold=self.cfg.dup_threshold,
-        )
-        dedup_service.prepare()
-
-        self.dedup_service = dedup_service
-        self.classifier = classifier
-        self.openai_client = OpenAIVisionClient(
-            model=self.cfg.openai_model,
-            timeout=self.cfg.openai_timeout,
-            proxy=self.cfg.openai_proxy,
-        )
-
-    def decode_request(self, request: dict[str, Any], **kwargs) -> dict[str, Any]:
-        if not isinstance(request, dict):
-            raise ValueError("Request body must be JSON object.")
-        request_id, items = normalize_images_payload(request, self._cfg.max_images_per_request)
-        return {"request_id": request_id, "items": items}
-
-    def batch(self, inputs: list[dict[str, Any]]) -> dict[str, Any]:
-        flat_items = []
-        request_ids = []
-        request_sizes = []
-        for req in inputs:
-            request_ids.append(req["request_id"])
-            request_sizes.append(len(req["items"]))
-            flat_items.extend(req["items"])
-        return {
-            "request_ids": request_ids,
-            "request_sizes": request_sizes,
-            "flat_items": flat_items,
-        }
-
-    def predict(
-        self,
-        batch: dict[str, Any],
-        **kwargs,
-    ) -> dict[str, Any] | list[dict[str, Any]]:
-        self._dedup_service.store.reset_predict_state()
-
-        if "request_id" in batch and "items" in batch:
-            return self._predict_one(batch)
-        if "flat_items" in batch:
-            return self._predict_many(batch)
-        raise TypeError("Unsupported batch payload for pipeline predict().")
-
-    def unbatch(self, output: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any] | list[dict[str, Any]]:
-        return output
-
-    def encode_response(self, output: dict[str, Any], **kwargs) -> dict[str, Any]:
-        return output
-
-    def health(self) -> bool:
-        try:
-            return (
-                self.dedup_service is not None
-                and self.classifier is not None
-                and self.openai_client is not None
-                and self._dedup_service.health()
-                and self._classifier.is_ready()
+        classification = classification_by_flat_idx.get(idx)
+        if not classification or classification.get("status") != "classified":
+            pipeline_results.append(
+                {
+                    "image_id": item["image_id"],
+                    "status": "error",
+                    "stage": "classification",
+                    "dedup": dedup_result,
+                    "classification": classification,
+                }
             )
-        except Exception:
-            logger.exception("Health check failed.")
-            return False
+            continue
 
-    def _predict_one(self, request: dict[str, Any]) -> dict[str, Any]:
-        started = time.perf_counter()
-        item_results = self._run_pipeline_on_items(request["items"])
-        return self._build_response(
-            request_id=request["request_id"],
-            item_results=item_results,
-            elapsed_seconds=time.perf_counter() - started,
-        )
-
-    def _predict_many(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
-        started = time.perf_counter()
-        item_results = self._run_pipeline_on_items(batch["flat_items"])
-        responses = []
-        cursor = 0
-        for request_id, size in zip(batch["request_ids"], batch["request_sizes"]):
-            request_results = item_results[cursor : cursor + size]
-            cursor += size
-            responses.append(
-                self._build_response(
-                    request_id=request_id,
-                    item_results=request_results,
-                    elapsed_seconds=time.perf_counter() - started,
-                )
+        # Only fake images should be sent to OpenAI VLM.
+        # Real images stop here after Triton classification.
+        if not is_fake_classification(classification):
+            logger.info(
+                "OpenAI VLM skipped: image_id=%s classification_label=%s reason=classification_label_is_not_fake",
+                item["image_id"],
+                classification.get("label"),
             )
-        return responses
-
-    def _run_pipeline_on_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        dedup_results, unique_records = self._dedup_service.deduplicate(items)
-        unique_by_flat_idx = {record["flat_idx"]: record for record in unique_records}
-
-        classification_by_flat_idx: dict[int, dict[str, Any]] = {}
-        if unique_records:
-            classify_results = self._classifier.classify([x["image"] for x in unique_records])
-            for record, classify_result in zip(unique_records, classify_results):
-                classification_by_flat_idx[record["flat_idx"]] = classify_result
-
-        pipeline_results: list[dict[str, Any]] = []
-        for idx, (item, dedup_result) in enumerate(zip(items, dedup_results)):
-            if dedup_result.get("status") == "duplicate":
-                pipeline_results.append(
-                    {
-                        "image_id": item["image_id"],
-                        "status": "skipped",
-                        "stage": "dedup",
-                        "dedup": dedup_result,
-                    }
-                )
-                continue
-
-            if dedup_result.get("status") != "unique":
-                pipeline_results.append(
-                    {
-                        "image_id": item["image_id"],
-                        "status": "error",
-                        "stage": "dedup",
-                        "dedup": dedup_result,
-                        "error": dedup_result.get("error"),
-                    }
-                )
-                continue
-
-            classification = classification_by_flat_idx.get(idx)
-            if not classification or classification.get("status") != "classified":
-                pipeline_results.append(
-                    {
-                        "image_id": item["image_id"],
-                        "status": "error",
-                        "stage": "classification",
-                        "dedup": dedup_result,
-                        "classification": classification,
-                    }
-                )
-                continue
-
-            record = unique_by_flat_idx[idx]
-            try:
-                vlm_result = self._openai_client.analyze(
-                    image_ref=image_ref_for_openai(record["image_ref"]),
-                    prompt=self._cfg.vlm_prompt,
-                    classification=classification,
-                )
-            except Exception as exc:
-                pipeline_results.append(
-                    {
-                        "image_id": item["image_id"],
-                        "status": "error",
-                        "stage": "openai",
-                        "dedup": dedup_result,
-                        "classification": classification,
-                        "error": str(exc),
-                    }
-                )
-                continue
-
             pipeline_results.append(
                 {
                     "image_id": item["image_id"],
                     "status": "completed",
+                    "stage": "classification",
                     "dedup": dedup_result,
                     "classification": classification,
-                    "vlm": vlm_result,
+                    "vlm": None,
+                    "openai_skipped": True,
+                    "skip_reason": "classification_label_is_not_fake",
                 }
             )
+            continue
 
-        return pipeline_results
+        record = unique_by_flat_idx[idx]
+        try:
+            openai_started = time.perf_counter()
+            vlm_result = runtime.openai_client.analyze(
+                image_ref=image_ref_for_openai(record["image_ref"]),
+                prompt=runtime.cfg.vlm_prompt,
+                classification=classification,
+            )
+            openai_elapsed = time.perf_counter() - openai_started
+            openai_call_count += 1
+            openai_total_elapsed += openai_elapsed
 
-    def _build_response(
-        self,
-        request_id: str,
-        item_results: list[dict[str, Any]],
-        elapsed_seconds: float,
-    ) -> dict[str, Any]:
-        dedup_statuses = [
-            result.get("dedup", {}).get("status")
-            for result in item_results
-            if isinstance(result.get("dedup"), dict)
-        ]
-        return {
-            "request_id": request_id,
-            "total_images": len(item_results),
-            "unique_count": sum(1 for status in dedup_statuses if status == "unique"),
-            "duplicate_count": sum(1 for status in dedup_statuses if status == "duplicate"),
-            "completed_count": sum(1 for result in item_results if result.get("status") == "completed"),
-            "error_count": sum(1 for result in item_results if result.get("status") == "error"),
-            "results": item_results,
-            "elapsed_seconds": round(elapsed_seconds, 4),
-            "milvus_recovered_this_predict": self._dedup_service.store.recovered_this_predict,
-            "last_milvus_error": self._dedup_service.store.last_error,
-        }
+            logger.info(
+                "OpenAI VLM completed: image_id=%s model=%s elapsed_seconds=%.4f",
+                item["image_id"],
+                runtime.cfg.openai_model,
+                openai_elapsed,
+            )
+        except Exception as exc:
+            openai_elapsed = time.perf_counter() - openai_started
+            logger.exception(
+                "OpenAI VLM failed: image_id=%s model=%s elapsed_seconds=%.4f",
+                item["image_id"],
+                runtime.cfg.openai_model,
+                openai_elapsed,
+            )
+            pipeline_results.append(
+                {
+                    "image_id": item["image_id"],
+                    "status": "error",
+                    "stage": "openai",
+                    "dedup": dedup_result,
+                    "classification": classification,
+                    "error": str(exc),
+                }
+            )
+            continue
 
-    @property
-    def _cfg(self) -> Settings:
-        if self.cfg is None:
-            raise RuntimeError("Pipeline settings are not initialized.")
-        return self.cfg
+        pipeline_results.append(
+            {
+                "image_id": item["image_id"],
+                "status": "completed",
+                "stage": "openai",
+                "dedup": dedup_result,
+                "classification": classification,
+                "vlm": vlm_result,
+            }
+        )
 
-    @property
-    def _dedup_service(self) -> DedupService:
-        if self.dedup_service is None:
-            raise RuntimeError("Dedup service is not initialized.")
-        return self.dedup_service
+    if openai_call_count:
+        logger.info(
+            "OpenAI VLM summary: calls=%s total_elapsed_seconds=%.4f avg_seconds_per_call=%.4f",
+            openai_call_count,
+            openai_total_elapsed,
+            openai_total_elapsed / openai_call_count,
+        )
+    else:
+        logger.info("OpenAI VLM summary: calls=0 total_elapsed_seconds=0.0000")
 
-    @property
-    def _classifier(self) -> TritonClassificationClient:
-        if self.classifier is None:
-            raise RuntimeError("Classification client is not initialized.")
-        return self.classifier
+    return pipeline_results
 
-    @property
-    def _openai_client(self) -> OpenAIVisionClient:
-        if self.openai_client is None:
-            raise RuntimeError("OpenAI client is not initialized.")
-        return self.openai_client
+
+
+
+def build_response(
+    runtime: PipelineRuntime,
+    request_id: str,
+    item_results: list[dict[str, Any]],
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    dedup_statuses = [
+        result.get("dedup", {}).get("status")
+        for result in item_results
+        if isinstance(result.get("dedup"), dict)
+    ]
+    return {
+        "request_id": request_id,
+        "total_images": len(item_results),
+        "unique_count": sum(1 for status in dedup_statuses if status == "unique"),
+        "duplicate_count": sum(1 for status in dedup_statuses if status == "duplicate"),
+        "completed_count": sum(1 for result in item_results if result.get("status") == "completed"),
+        "error_count": sum(1 for result in item_results if result.get("status") == "error"),
+        "results": item_results,
+        "elapsed_seconds": round(elapsed_seconds, 4),
+        "milvus_recovered_this_predict": runtime.dedup_service.store.recovered_this_predict,
+        "last_milvus_error": runtime.dedup_service.store.last_error,
+    }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Triton pipeline FastAPI server starting.")
+    app.state.runtime = await run_in_threadpool(build_runtime)
+
+    import asyncio
+
+    # MilvusDedupStore has per-request mutable state:
+    # recovered_this_predict and last_error.
+    # This lock keeps /analyze safe without changing your existing store code.
+    app.state.analyze_lock = asyncio.Lock()
+    logger.info("Triton pipeline worker setup completed.")
+
+    try:
+        yield
+    finally:
+        try:
+            from pymilvus import connections
+
+            connections.disconnect(alias="default")
+        except Exception:
+            logger.exception("Failed to disconnect Milvus cleanly.")
+
+
+app = FastAPI(
+    title="Triton Dedup Classification OpenAI API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+def get_runtime(request: Request) -> PipelineRuntime:
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="Runtime is not initialized.")
+    return runtime
+
+
+@app.get("/healthz")
+async def healthz(request: Request) -> dict[str, Any]:
+    runtime = get_runtime(request)
+    is_healthy = await run_in_threadpool(health, runtime)
+    if not is_healthy:
+        raise HTTPException(
+            status_code=503,
+            detail="Triton, Milvus, or OpenAI runtime is not ready.",
+        )
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health_alias(request: Request) -> dict[str, Any]:
+    return await healthz(request)
+
+
+@app.post("/analyze")
+async def analyze(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+    runtime = get_runtime(request)
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Request body must be JSON object.")
+
+    try:
+        request_id, items = normalize_images_payload(
+            payload,
+            runtime.cfg.max_images_per_request,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    started = time.perf_counter()
+
+    async with request.app.state.analyze_lock:
+        runtime.dedup_service.store.reset_predict_state()
+        item_results = await run_in_threadpool(run_pipeline_on_items, runtime, items)
+
+    return build_response(
+        runtime=runtime,
+        request_id=request_id,
+        item_results=item_results,
+        elapsed_seconds=time.perf_counter() - started,
+    )
 
 
 def main() -> None:
-    api = TritonDedupClassificationOpenAIAPI()
-    server = ls.LitServer(
-        api,
-        accelerator=os.getenv("LITSERVE_ACCELERATOR", "cpu"),
-        devices=os.getenv("LITSERVE_DEVICES", "1"),
-        workers_per_device=int(os.getenv("LITSERVE_WORKERS_PER_DEVICE", "1")),
-        timeout=int(os.getenv("LITSERVE_REQUEST_TIMEOUT", "180")),
-        track_requests=True,
-        max_payload_size=os.getenv("LITSERVE_MAX_PAYLOAD_SIZE", "100MB"),
-        callbacks=[PipelineCallback()],
-    )
-    server.run(
-        host=os.getenv("HOST", os.getenv("API_HOST", "0.0.0.0")),
+    import uvicorn
+
+    uvicorn.run(
+        "pipeline_server:app",
+        host=os.getenv("HOST", os.getenv("API_HOST", "127.0.0.1")),
         port=int(
             os.getenv(
                 "PIPELINE_PORT",
                 os.getenv("API_PORT", os.getenv("PORT", "8002")),
             )
         ),
+        workers=int(os.getenv("FASTAPI_WORKERS", "1")),
+        timeout_keep_alive=int(os.getenv("FASTAPI_TIMEOUT_KEEP_ALIVE", "75")),
     )
 
 
 if __name__ == "__main__":
     main()
+

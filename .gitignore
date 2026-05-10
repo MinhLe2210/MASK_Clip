@@ -43,3 +43,5 @@ models/
 Thumbs.db
 .idea/
 .vscode/
+# 
+codesynth.md

@@ -1,8 +1,10 @@
-litserve
+fastapi
+uvicorn
 python-dotenv
 requests
 openai
 numpy
 Pillow
-pymilvus==2.3.14
+pymilvus
 tritonclient[http]
+gradio>=5.29.0

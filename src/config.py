@@ -1,6 +1,26 @@
 import os
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
+
+def load_openai_prompt() -> str:
+    prompt_path = Path(__file__).with_name("prompt.json")
+
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+
+    with prompt_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    prompt = data.get("openai_prompt")
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(
+            "src/prompt.json must contain non-empty 'openai_prompt'."
+        )
+
+    return prompt.strip()
 
 def _required_env(name: str, default: str | None = None) -> str:
     value = os.getenv(name, default)
@@ -81,7 +101,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        triton_raw = _required_env("TRITON_URL", "http://127.0.0.1:30000")
+        triton_raw = _required_env("TRITON_URL", "http://127.0.0.1:8000")
         triton_http_url, triton_client_url = _normalize_triton_http_url(triton_raw)
 
         classification_labels = [
@@ -127,15 +147,7 @@ class Settings:
                     _optional_env("REQUEST_TIMEOUT") or "120",
                 )
             ),
-            vlm_prompt=_required_env(
-                "OPENAI_VLM_PROMPT",
-                (
-                    "Analyze the image after Triton embedding deduplication and Triton "
-                    "classification. Use the classification result as a signal, but rely "
-                    "on the visual content when explaining the final answer. Return "
-                    "concise JSON with keys: summary, decision, reasons."
-                ),
-            ),
+            vlm_prompt=load_openai_prompt(),
             collection_name=_required_env(
                 "COLLECTION_NAME",
                 "ai_detector_images_deduplicate",

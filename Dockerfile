@@ -7,10 +7,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN --mount=type=secret,id=pip_conf,target=/etc/pip.conf,required=false \
+--mount=type=cache,target=/root/.cache/pip \
+pip install \
+--default-timeout=100 \
+--retries=3 \
+-r requirements.txt
 
 COPY . .
 
 EXPOSE 8002
 
-CMD ["python", "pipeline_server.py"]
+CMD ["uvicorn", "pipeline_server:app", "--host", "0.0.0.0", "--port", "8002"]

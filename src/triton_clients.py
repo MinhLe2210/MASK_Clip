@@ -7,7 +7,7 @@ from PIL import Image
 from tritonclient.utils import np_to_triton_dtype
 
 
-logger = logging.getLogger("pipeline-litserve")
+logger = logging.getLogger("pipeline-fastapi")
 
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)

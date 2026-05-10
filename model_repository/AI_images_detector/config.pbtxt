@@ -1,7 +1,7 @@
 name: "AI_images_detector"
 backend: "onnxruntime"
-default_model_filename: "model.onnx"
-max_batch_size: 64
+default_model_filename: "dino_ver_5.onnx"
+max_batch_size: 16
 
 input [
   {
@@ -28,6 +28,6 @@ instance_group [
 ]
 
 dynamic_batching {
-  preferred_batch_size: [ 4, 8, 16, 32 ]
+  preferred_batch_size: [ 1, 4, 8, 16 ]
   max_queue_delay_microseconds: 5000
 }

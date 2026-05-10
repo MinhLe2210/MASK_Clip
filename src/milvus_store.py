@@ -23,7 +23,7 @@ except Exception:
     ConnectionNotExistException = MilvusException
 
 
-logger = logging.getLogger("pipeline-litserve")
+logger = logging.getLogger("pipeline-fastapi")
 
 
 class MilvusDedupStore:
