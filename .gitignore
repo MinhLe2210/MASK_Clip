@@ -30,6 +30,7 @@ dist/
 !.env.example
 
 # Model and inference artifacts
+model_repository/
 models/
 *.onnx
 *.engine
