@@ -1,5 +1,6 @@
 import logging
 import time
+import json
 from threading import Lock
 from typing import Any, Callable
 
@@ -25,11 +26,15 @@ except Exception:
 
 logger = logging.getLogger("pipeline-fastapi")
 
+CACHE_JSON_MAX_LENGTH = 65535
+CACHE_SKIP_REASON_MAX_LENGTH = 512
+
 
 class MilvusDedupStore:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self.collection: Collection | None = None
+        self.result_cache_collection: Collection | None = None
         self._lock = Lock()
         self.recovered_this_predict = 0
         self.last_error: str | None = None
@@ -59,19 +64,46 @@ class MilvusDedupStore:
                 collection = Collection(self.cfg.collection_name, using="default")
                 collection.load()
                 self.collection = collection
-                self._wait_for_collection_loaded()
+                self._wait_for_collection_loaded(self.cfg.collection_name)
                 logger.info("Loaded Milvus collection: %s", self.cfg.collection_name)
-                return collection
+            else:
+                collection = self._create_collection()
+                self.collection = collection
+                logger.info("Created Milvus collection: %s", self.cfg.collection_name)
 
-            collection = self._create_collection()
-            self.collection = collection
-            logger.info("Created Milvus collection: %s", self.cfg.collection_name)
+            if utility.has_collection(
+                self.cfg.result_cache_collection_name,
+                using="default",
+            ):
+                result_cache_collection = Collection(
+                    self.cfg.result_cache_collection_name,
+                    using="default",
+                )
+                result_cache_collection.load()
+                self.result_cache_collection = result_cache_collection
+                self._wait_for_collection_loaded(self.cfg.result_cache_collection_name)
+                logger.info(
+                    "Loaded Milvus result cache collection: %s",
+                    self.cfg.result_cache_collection_name,
+                )
+            else:
+                result_cache_collection = self._create_result_cache_collection()
+                self.result_cache_collection = result_cache_collection
+                logger.info(
+                    "Created Milvus result cache collection: %s",
+                    self.cfg.result_cache_collection_name,
+                )
+
             return collection
 
     def health(self) -> bool:
         return bool(
             self.with_retry(
-                lambda: utility.has_collection(self.cfg.collection_name, using="default"),
+                lambda: utility.has_collection(self.cfg.collection_name, using="default")
+                and utility.has_collection(
+                    self.cfg.result_cache_collection_name,
+                    using="default",
+                ),
                 op_name="health_check",
                 retries=1,
             )
@@ -101,6 +133,75 @@ class MilvusDedupStore:
                     "image_id": row["image_id"],
                     "image_sha256": row["image_sha256"],
                 }
+        return found
+
+    def query_cached_results(self, hashes: list[str]) -> dict[str, dict[str, Any]]:
+        collection = self._require_result_cache_collection()
+        unique_hashes = sorted(set(h for h in hashes if h))
+        if not unique_hashes:
+            return {}
+
+        found: dict[str, dict[str, Any]] = {}
+        chunk_size = 100
+        for i in range(0, len(unique_hashes), chunk_size):
+            chunk = unique_hashes[i : i + chunk_size]
+            quoted = ",".join(f'"{h}"' for h in chunk)
+            expr = f'image_sha256 in [{quoted}]'
+            rows = collection.query(
+                expr=expr,
+                output_fields=[
+                    "image_sha256",
+                    "image_id",
+                    "pipeline_stage",
+                    "classification_json",
+                    "vlm_json",
+                    "openai_skipped",
+                    "skip_reason",
+                ],
+            )
+            for row in rows:
+                image_sha256 = row.get("image_sha256")
+                if not image_sha256:
+                    continue
+
+                classification = self._deserialize_json_field(
+                    row.get("classification_json")
+                )
+                if classification is None:
+                    continue
+
+                found[image_sha256] = {
+                    "image_id": row.get("image_id"),
+                    "image_sha256": image_sha256,
+                    "pipeline_stage": row.get("pipeline_stage"),
+                    "classification": classification,
+                    "vlm": self._deserialize_json_field(row.get("vlm_json")),
+                    "openai_skipped": bool(row.get("openai_skipped")),
+                    "skip_reason": row.get("skip_reason") or None,
+                }
+        return found
+
+    def query_existing_cached_hashes(self, hashes: list[str]) -> set[str]:
+        collection = self._require_result_cache_collection()
+        unique_hashes = sorted(set(h for h in hashes if h))
+        if not unique_hashes:
+            return set()
+
+        found: set[str] = set()
+        chunk_size = 100
+        for i in range(0, len(unique_hashes), chunk_size):
+            chunk = unique_hashes[i : i + chunk_size]
+            quoted = ",".join(f'"{h}"' for h in chunk)
+            expr = f'image_sha256 in [{quoted}]'
+            rows = collection.query(
+                expr=expr,
+                output_fields=["image_sha256"],
+            )
+            found.update(
+                row["image_sha256"]
+                for row in rows
+                if isinstance(row, dict) and row.get("image_sha256")
+            )
         return found
 
     def search_nearest_batch(self, vectors: np.ndarray) -> list[dict[str, Any] | None]:
@@ -192,6 +293,69 @@ class MilvusDedupStore:
                 result["milvus_id"] = int(primary_keys[idx])
             results[flat_idx] = result
 
+    def insert_result_cache(self, rows: list[dict[str, Any]]) -> None:
+        collection = self._require_result_cache_collection()
+        existing_hashes = self.query_existing_cached_hashes(
+            [row["image_sha256"] for row in rows if row.get("image_sha256")]
+        )
+
+        rows_to_insert = []
+        for row in rows:
+            image_sha256 = row.get("image_sha256")
+            if not image_sha256 or image_sha256 in existing_hashes:
+                continue
+
+            classification_json = self._serialize_json_field(row.get("classification"))
+            if classification_json is None:
+                logger.warning(
+                    "Skipping result cache insert because classification is missing or too large: image_id=%s sha256=%s",
+                    row.get("image_id"),
+                    image_sha256,
+                )
+                continue
+
+            vlm_json = self._serialize_json_field(row.get("vlm"))
+            if row.get("vlm") is not None and vlm_json is None:
+                logger.warning(
+                    "Skipping result cache insert because VLM payload is too large: image_id=%s sha256=%s",
+                    row.get("image_id"),
+                    image_sha256,
+                )
+                continue
+
+            skip_reason = row.get("skip_reason")
+            if skip_reason is not None:
+                skip_reason = str(skip_reason)[:CACHE_SKIP_REASON_MAX_LENGTH]
+
+            rows_to_insert.append(
+                {
+                    "image_sha256": image_sha256,
+                    "image_id": str(row.get("image_id") or ""),
+                    "pipeline_stage": str(row.get("pipeline_stage") or ""),
+                    "classification_json": classification_json,
+                    "vlm_json": vlm_json or "",
+                    "openai_skipped": bool(row.get("openai_skipped")),
+                    "skip_reason": skip_reason or "",
+                }
+            )
+
+        if not rows_to_insert:
+            return
+
+        collection.insert(
+            [
+                [row["image_sha256"] for row in rows_to_insert],
+                [row["image_id"] for row in rows_to_insert],
+                [row["pipeline_stage"] for row in rows_to_insert],
+                [row["classification_json"] for row in rows_to_insert],
+                [row["vlm_json"] for row in rows_to_insert],
+                [row["openai_skipped"] for row in rows_to_insert],
+                [row["skip_reason"] for row in rows_to_insert],
+            ]
+        )
+        if self.cfg.flush_on_insert:
+            collection.flush()
+
     def with_retry(
         self,
         fn: Callable[[], Any],
@@ -253,13 +417,56 @@ class MilvusDedupStore:
             },
         )
         collection.load()
-        self._wait_for_collection_loaded()
+        self._wait_for_collection_loaded(self.cfg.collection_name)
         return collection
 
-    def _wait_for_collection_loaded(self) -> None:
+    def _create_result_cache_collection(self) -> Collection:
+        fields = [
+            FieldSchema(
+                name="image_sha256",
+                dtype=DataType.VARCHAR,
+                max_length=128,
+                is_primary=True,
+                auto_id=False,
+            ),
+            FieldSchema(name="image_id", dtype=DataType.VARCHAR, max_length=2048),
+            FieldSchema(name="pipeline_stage", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(
+                name="classification_json",
+                dtype=DataType.VARCHAR,
+                max_length=CACHE_JSON_MAX_LENGTH,
+            ),
+            FieldSchema(
+                name="vlm_json",
+                dtype=DataType.VARCHAR,
+                max_length=CACHE_JSON_MAX_LENGTH,
+            ),
+            FieldSchema(name="openai_skipped", dtype=DataType.BOOL),
+            FieldSchema(
+                name="skip_reason",
+                dtype=DataType.VARCHAR,
+                max_length=CACHE_SKIP_REASON_MAX_LENGTH,
+            ),
+        ]
+
+        schema = CollectionSchema(
+            fields=fields,
+            description="Cached classification and VLM responses by image sha256",
+        )
+
+        collection = Collection(
+            name=self.cfg.result_cache_collection_name,
+            schema=schema,
+            using="default",
+        )
+        collection.load()
+        self._wait_for_collection_loaded(self.cfg.result_cache_collection_name)
+        return collection
+
+    def _wait_for_collection_loaded(self, collection_name: str) -> None:
         try:
             utility.wait_for_loading_complete(
-                collection_name=self.cfg.collection_name,
+                collection_name=collection_name,
                 timeout=self.cfg.milvus_load_timeout,
                 using="default",
             )
@@ -270,6 +477,35 @@ class MilvusDedupStore:
         if self.collection is None:
             raise RuntimeError("Milvus collection is not initialized.")
         return self.collection
+
+    def _require_result_cache_collection(self) -> Collection:
+        if self.result_cache_collection is None:
+            raise RuntimeError("Milvus result cache collection is not initialized.")
+        return self.result_cache_collection
+
+    @staticmethod
+    def _serialize_json_field(value: Any) -> str | None:
+        if value is None:
+            return None
+
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if len(serialized) > CACHE_JSON_MAX_LENGTH:
+            return None
+        return serialized
+
+    @staticmethod
+    def _deserialize_json_field(value: Any) -> Any:
+        if value in (None, ""):
+            return None
+
+        if isinstance(value, (dict, list)):
+            return value
+
+        try:
+            return json.loads(value)
+        except Exception:
+            logger.warning("Failed to decode cached JSON payload from Milvus.")
+            return None
 
     @staticmethod
     def _looks_like_milvus_failure(exc: Exception) -> bool:

@@ -86,6 +86,7 @@ class Settings:
     vlm_prompt: str
 
     collection_name: str
+    result_cache_collection_name: str
     milvus_host: str
     milvus_port: str
     milvus_database: str | None
@@ -103,6 +104,10 @@ class Settings:
     def from_env(cls) -> "Settings":
         triton_raw = _required_env("TRITON_URL", "http://127.0.0.1:8000")
         triton_http_url, triton_client_url = _normalize_triton_http_url(triton_raw)
+        collection_name = _required_env(
+            "COLLECTION_NAME",
+            "ai_detector_images_deduplicate",
+        )
 
         classification_labels = [
             x.strip()
@@ -148,9 +153,10 @@ class Settings:
                 )
             ),
             vlm_prompt=load_openai_prompt(),
-            collection_name=_required_env(
-                "COLLECTION_NAME",
-                "ai_detector_images_deduplicate",
+            collection_name=collection_name,
+            result_cache_collection_name=_required_env(
+                "RESULT_CACHE_COLLECTION_NAME",
+                f"{collection_name}_results",
             ),
             milvus_host=_required_env("MILVUS_HOST"),
             milvus_port=_required_env("MILVUS_PORT", "19530"),

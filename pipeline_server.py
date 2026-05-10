@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,7 +13,7 @@ from starlette.concurrency import run_in_threadpool
 
 from src.config import Settings
 from src.dedup_service import DedupService
-from src.image_io import image_ref_for_openai
+from src.image_io import bytes_from_ref, bytes_to_pil, image_ref_for_openai
 from src.milvus_store import MilvusDedupStore
 from src.triton_clients import TritonClassificationClient, TritonEmbeddingClient
 
@@ -198,10 +199,51 @@ def is_fake_classification(classification: dict[str, Any]) -> bool:
     label = classification.get("label")
     return isinstance(label, str) and label.strip().lower() == "fake"
 
+def build_cached_payload(
+    *,
+    image_id: str,
+    image_sha256: str | None,
+    pipeline_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    classification = pipeline_result.get("classification")
+    if not isinstance(classification, dict):
+        return None
 
-# Patch đề xuất cho pipeline_server.py
-# Mục tiêu: log thời gian chạy riêng cho dedup, classification, và OpenAI VLM.
-# Ghi chú: OpenAI VLM chỉ được gọi khi classification label == fake.
+    return {
+        "image_id": image_id,
+        "image_sha256": image_sha256,
+        "pipeline_stage": pipeline_result.get("stage"),
+        "classification": deepcopy(classification),
+        "vlm": deepcopy(pipeline_result.get("vlm")),
+        "openai_skipped": bool(pipeline_result.get("openai_skipped")),
+        "skip_reason": pipeline_result.get("skip_reason"),
+    }
+
+
+def build_duplicate_cache_response(
+    *,
+    image_id: str,
+    dedup_result: dict[str, Any],
+    cached_payload: dict[str, Any],
+    cache_source: str,
+) -> dict[str, Any]:
+    result = {
+        "image_id": image_id,
+        "status": "completed",
+        "stage": cached_payload.get("pipeline_stage") or "dedup",
+        "dedup": dedup_result,
+        "classification": deepcopy(cached_payload.get("classification")),
+        "vlm": deepcopy(cached_payload.get("vlm")),
+        "served_from_cache": True,
+        "cache_source": cache_source,
+        "cached_from_image_id": cached_payload.get("image_id"),
+        "cached_from_sha256": cached_payload.get("image_sha256"),
+    }
+    if cached_payload.get("openai_skipped"):
+        result["openai_skipped"] = True
+    if cached_payload.get("skip_reason"):
+        result["skip_reason"] = cached_payload.get("skip_reason")
+    return result
 
 
 def run_pipeline_on_items(
@@ -239,20 +281,151 @@ def run_pipeline_on_items(
     else:
         logger.info("Classification skipped: unique_records=0")
 
+    duplicate_hashes = sorted(
+        {
+            result.get("matched_sha256")
+            for result in dedup_results
+            if isinstance(result, dict)
+            and result.get("status") == "duplicate"
+            and result.get("matched_sha256")
+        }
+    )
+    persistent_cache_by_hash = (
+        runtime.dedup_service.store.with_retry(
+            lambda: runtime.dedup_service.store.query_cached_results(duplicate_hashes),
+            op_name="query_cached_results",
+        )
+        if duplicate_hashes
+        else {}
+    )
+
     openai_call_count = 0
     openai_total_elapsed = 0.0
+    cached_payload_by_image_id: dict[str, dict[str, Any]] = {}
+    cached_payload_by_sha256: dict[str, dict[str, Any]] = {}
+    cache_rows_to_persist: dict[str, dict[str, Any]] = {}
 
     pipeline_results: list[dict[str, Any]] = []
     for idx, (item, dedup_result) in enumerate(zip(items, dedup_results)):
         if dedup_result.get("status") == "duplicate":
-            pipeline_results.append(
-                {
-                    "image_id": item["image_id"],
-                    "status": "skipped",
-                    "stage": "dedup",
-                    "dedup": dedup_result,
-                }
-            )
+            matched_image_id = dedup_result.get("matched_image_id")
+            matched_sha256 = dedup_result.get("matched_sha256")
+            cached_payload = None
+            cache_source = None
+
+            if matched_image_id and matched_image_id in cached_payload_by_image_id:
+                cached_payload = cached_payload_by_image_id[matched_image_id]
+                cache_source = "request_memory"
+            elif matched_sha256 and matched_sha256 in cached_payload_by_sha256:
+                cached_payload = cached_payload_by_sha256[matched_sha256]
+                cache_source = "request_memory"
+            elif matched_sha256 and matched_sha256 in persistent_cache_by_hash:
+                cached_payload = persistent_cache_by_hash[matched_sha256]
+                cache_source = "milvus_result_cache"
+
+            if cached_payload:
+                pipeline_results.append(
+                    build_duplicate_cache_response(
+                        image_id=item["image_id"],
+                        dedup_result=dedup_result,
+                        cached_payload=cached_payload,
+                        cache_source=cache_source or "unknown",
+                    )
+                )
+                cached_payload_by_image_id[item["image_id"]] = cached_payload
+                if matched_sha256:
+                    cached_payload_by_sha256[matched_sha256] = cached_payload
+            elif matched_sha256:
+                logger.info(
+                    "Duplicate cache miss. Rebuilding classification/VLM result: image_id=%s matched_image_id=%s matched_sha256=%s",
+                    item["image_id"],
+                    matched_image_id,
+                    matched_sha256,
+                )
+                try:
+                    duplicate_image = bytes_to_pil(bytes_from_ref(item["image_ref"]))
+                    duplicate_classification = runtime.classifier.classify([duplicate_image])[0]
+                    if duplicate_classification.get("status") != "classified":
+                        raise RuntimeError("duplicate_cache_rebuild_classification_failed")
+
+                    if not is_fake_classification(duplicate_classification):
+                        pipeline_results.append(
+                            {
+                                "image_id": item["image_id"],
+                                "status": "completed",
+                                "stage": "classification",
+                                "dedup": dedup_result,
+                                "classification": duplicate_classification,
+                                "vlm": None,
+                                "openai_skipped": True,
+                                "skip_reason": "classification_label_is_not_fake",
+                                "cache_backfilled": True,
+                            }
+                        )
+                    else:
+                        openai_started = time.perf_counter()
+                        duplicate_vlm_result = runtime.openai_client.analyze(
+                            image_ref=image_ref_for_openai(item["image_ref"]),
+                            prompt=runtime.cfg.vlm_prompt,
+                            classification=duplicate_classification,
+                        )
+                        openai_elapsed = time.perf_counter() - openai_started
+                        openai_call_count += 1
+                        openai_total_elapsed += openai_elapsed
+                        logger.info(
+                            "OpenAI VLM completed during duplicate cache rebuild: image_id=%s model=%s elapsed_seconds=%.4f",
+                            item["image_id"],
+                            runtime.cfg.openai_model,
+                            openai_elapsed,
+                        )
+                        pipeline_results.append(
+                            {
+                                "image_id": item["image_id"],
+                                "status": "completed",
+                                "stage": "openai",
+                                "dedup": dedup_result,
+                                "classification": duplicate_classification,
+                                "vlm": duplicate_vlm_result,
+                                "cache_backfilled": True,
+                            }
+                        )
+
+                    cached_payload = build_cached_payload(
+                        image_id=str(matched_image_id or item["image_id"]),
+                        image_sha256=matched_sha256,
+                        pipeline_result=pipeline_results[-1],
+                    )
+                    if cached_payload:
+                        if matched_image_id:
+                            cached_payload_by_image_id[str(matched_image_id)] = cached_payload
+                        cached_payload_by_image_id[item["image_id"]] = cached_payload
+                        cached_payload_by_sha256[matched_sha256] = cached_payload
+                        cache_rows_to_persist[matched_sha256] = cached_payload
+                except Exception as exc:
+                    logger.exception(
+                        "Duplicate cache rebuild failed: image_id=%s matched_image_id=%s matched_sha256=%s",
+                        item["image_id"],
+                        matched_image_id,
+                        matched_sha256,
+                    )
+                    pipeline_results.append(
+                        {
+                            "image_id": item["image_id"],
+                            "status": "error",
+                            "stage": "dedup_cache_rebuild",
+                            "dedup": dedup_result,
+                            "error": str(exc),
+                        }
+                    )
+            else:
+                pipeline_results.append(
+                    {
+                        "image_id": item["image_id"],
+                        "status": "skipped",
+                        "stage": "dedup",
+                        "dedup": dedup_result,
+                    }
+                )
             continue
 
         if dedup_result.get("status") != "unique":
@@ -300,6 +473,15 @@ def run_pipeline_on_items(
                     "skip_reason": "classification_label_is_not_fake",
                 }
             )
+            cached_payload = build_cached_payload(
+                image_id=item["image_id"],
+                image_sha256=dedup_result.get("sha256"),
+                pipeline_result=pipeline_results[-1],
+            )
+            if cached_payload and dedup_result.get("sha256"):
+                cached_payload_by_image_id[item["image_id"]] = cached_payload
+                cached_payload_by_sha256[dedup_result["sha256"]] = cached_payload
+                cache_rows_to_persist[dedup_result["sha256"]] = cached_payload
             continue
 
         record = unique_by_flat_idx[idx]
@@ -350,6 +532,15 @@ def run_pipeline_on_items(
                 "vlm": vlm_result,
             }
         )
+        cached_payload = build_cached_payload(
+            image_id=item["image_id"],
+            image_sha256=dedup_result.get("sha256"),
+            pipeline_result=pipeline_results[-1],
+        )
+        if cached_payload and dedup_result.get("sha256"):
+            cached_payload_by_image_id[item["image_id"]] = cached_payload
+            cached_payload_by_sha256[dedup_result["sha256"]] = cached_payload
+            cache_rows_to_persist[dedup_result["sha256"]] = cached_payload
 
     if openai_call_count:
         logger.info(
@@ -360,6 +551,14 @@ def run_pipeline_on_items(
         )
     else:
         logger.info("OpenAI VLM summary: calls=0 total_elapsed_seconds=0.0000")
+
+    if cache_rows_to_persist:
+        runtime.dedup_service.store.with_retry(
+            lambda: runtime.dedup_service.store.insert_result_cache(
+                list(cache_rows_to_persist.values())
+            ),
+            op_name="insert_result_cache",
+        )
 
     return pipeline_results
 
