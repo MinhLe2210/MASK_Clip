@@ -103,7 +103,7 @@ class TritonNfaVitClient(TritonModelClient):
             (1, 1, image_np.shape[2], image_np.shape[3]),
             dtype=np.float32,
         )
-        dummy_label = np.array([self.label_value], dtype=np.float32)
+        dummy_label = np.array([[self.label_value]], dtype=np.float32)
 
         inputs = [
             httpclient.InferInput(

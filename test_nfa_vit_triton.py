@@ -192,7 +192,7 @@ def infer(args: argparse.Namespace) -> dict:
         mode=args.mode,
     )
     dummy_mask = np.zeros((1, 1, image_np.shape[2], image_np.shape[3]), dtype=np.float32)
-    dummy_label = np.array([args.label_value], dtype=np.float32)
+    dummy_label = np.array([[args.label_value]], dtype=np.float32)
 
     payload = {
         "inputs": [

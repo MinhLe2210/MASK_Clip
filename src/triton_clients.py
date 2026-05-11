@@ -39,12 +39,38 @@ class TritonModelClient:
             connection_timeout=timeout,
             network_timeout=timeout,
         )
+        self.max_batch_size = 0
 
     def is_ready(self) -> bool:
         return bool(self.client.is_model_ready(self.model_name))
 
     def _get_model_metadata(self) -> dict[str, Any]:
         return self.client.get_model_metadata(self.model_name)
+
+    def _get_model_config(self) -> dict[str, Any]:
+        config = self.client.get_model_config(self.model_name)
+        if isinstance(config, dict) and isinstance(config.get("config"), dict):
+            return config["config"]
+        return config
+
+    def _infer_max_batch_size(self) -> int:
+        try:
+            config = self._get_model_config()
+            value = config.get("max_batch_size", 0) if isinstance(config, dict) else 0
+            return int(value)
+        except Exception:
+            logger.warning(
+                "Could not fetch max_batch_size for Triton model '%s'. Falling back to unchunked requests.",
+                self.model_name,
+            )
+            return 0
+
+    def _get_request_batch_limit(self, item_count: int) -> int:
+        if self.max_batch_size <= 0:
+            self.max_batch_size = self._infer_max_batch_size()
+        if self.max_batch_size > 0:
+            return self.max_batch_size
+        return max(1, item_count)
 
     def _infer_fixed_image_size(self, input_name: str) -> int:
         metadata = self._get_model_metadata()
@@ -103,49 +129,56 @@ class TritonEmbeddingClient(TritonModelClient):
         if not images:
             return np.empty((0, self.embedding_dim or 0), dtype=np.float32)
 
-        batch = np.stack(
-            [resize_and_normalize(image, self.image_size) for image in images],
-            axis=0,
-        ).astype(np.float32)
+        batch_limit = self._get_request_batch_limit(len(images))
+        vectors_list: list[np.ndarray] = []
 
-        inputs = [
-            httpclient.InferInput(
-                self.input_name,
-                list(batch.shape),
-                np_to_triton_dtype(batch.dtype),
-            )
-        ]
-        inputs[0].set_data_from_numpy(batch)
+        for start in range(0, len(images), batch_limit):
+            image_batch = images[start : start + batch_limit]
+            batch = np.stack(
+                [resize_and_normalize(image, self.image_size) for image in image_batch],
+                axis=0,
+            ).astype(np.float32)
 
-        outputs = [httpclient.InferRequestedOutput(self.output_name)]
-        result = self.client.infer(
-            model_name=self.model_name,
-            inputs=inputs,
-            outputs=outputs,
-        )
+            inputs = [
+                httpclient.InferInput(
+                    self.input_name,
+                    list(batch.shape),
+                    np_to_triton_dtype(batch.dtype),
+                )
+            ]
+            inputs[0].set_data_from_numpy(batch)
 
-        vectors = result.as_numpy(self.output_name)
-        if vectors is None:
-            raise RuntimeError(
-                f"No output named '{self.output_name}' returned from Triton model '{self.model_name}'."
-            )
-
-        vectors = np.asarray(vectors, dtype=np.float32)
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
-        elif vectors.ndim == 3:
-            vectors = vectors.mean(axis=1)
-        elif vectors.ndim > 3:
-            vectors = vectors.reshape((vectors.shape[0], -1))
-
-        if self.embedding_dim is not None and vectors.shape[1] != self.embedding_dim:
-            raise ValueError(
-                f"Embedding dim mismatch for model '{self.model_name}': "
-                f"expected {self.embedding_dim}, got {vectors.shape[1]}"
+            outputs = [httpclient.InferRequestedOutput(self.output_name)]
+            result = self.client.infer(
+                model_name=self.model_name,
+                inputs=inputs,
+                outputs=outputs,
             )
 
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        return vectors / np.clip(norms, 1e-12, None)
+            vectors = result.as_numpy(self.output_name)
+            if vectors is None:
+                raise RuntimeError(
+                    f"No output named '{self.output_name}' returned from Triton model '{self.model_name}'."
+                )
+
+            vectors = np.asarray(vectors, dtype=np.float32)
+            if vectors.ndim == 1:
+                vectors = vectors.reshape(1, -1)
+            elif vectors.ndim == 3:
+                vectors = vectors.mean(axis=1)
+            elif vectors.ndim > 3:
+                vectors = vectors.reshape((vectors.shape[0], -1))
+
+            if self.embedding_dim is not None and vectors.shape[1] != self.embedding_dim:
+                raise ValueError(
+                    f"Embedding dim mismatch for model '{self.model_name}': "
+                    f"expected {self.embedding_dim}, got {vectors.shape[1]}"
+                )
+
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            vectors_list.append(vectors / np.clip(norms, 1e-12, None))
+
+        return np.concatenate(vectors_list, axis=0)
 
 
 class TritonClassificationClient(TritonModelClient):
@@ -169,60 +202,64 @@ class TritonClassificationClient(TritonModelClient):
         if not images:
             return []
 
-        batch = np.stack(
-            [resize_and_normalize(image, self.image_size) for image in images],
-            axis=0,
-        ).astype(np.float32)
-
-        inputs = [
-            httpclient.InferInput(
-                self.input_name,
-                list(batch.shape),
-                np_to_triton_dtype(batch.dtype),
-            )
-        ]
-        inputs[0].set_data_from_numpy(batch)
-
-        outputs = [httpclient.InferRequestedOutput(self.output_name)]
-        result = self.client.infer(
-            model_name=self.model_name,
-            inputs=inputs,
-            outputs=outputs,
-        )
-
-        logits = result.as_numpy(self.output_name)
-        if logits is None:
-            raise RuntimeError(
-                f"No output named '{self.output_name}' returned from Triton model '{self.model_name}'."
-            )
-
-        logits = np.asarray(logits, dtype=np.float32)
-        if logits.ndim == 1:
-            logits = logits.reshape(1, -1)
-        elif logits.ndim == 3:
-            logits = logits[:, 0, :]
-        elif logits.ndim > 3:
-            logits = logits.reshape((logits.shape[0], -1))
-
-        probs = softmax(logits)
         results = []
-        for row_logits, row_probs in zip(logits, probs):
-            class_index = int(np.argmax(row_probs))
-            label = self.labels[class_index] if class_index < len(self.labels) else str(class_index)
-            results.append(
-                {
-                    "status": "classified",
-                    "backend": "triton",
-                    "label": label,
-                    "class_index": class_index,
-                    "confidence": float(row_probs[class_index]),
-                    "logits": row_logits.astype(float).tolist(),
-                    "scores": {
-                        label_name: float(row_probs[idx])
-                        for idx, label_name in enumerate(self.labels)
-                        if idx < len(row_probs)
-                    },
-                }
+        batch_limit = self._get_request_batch_limit(len(images))
+
+        for start in range(0, len(images), batch_limit):
+            image_batch = images[start : start + batch_limit]
+            batch = np.stack(
+                [resize_and_normalize(image, self.image_size) for image in image_batch],
+                axis=0,
+            ).astype(np.float32)
+
+            inputs = [
+                httpclient.InferInput(
+                    self.input_name,
+                    list(batch.shape),
+                    np_to_triton_dtype(batch.dtype),
+                )
+            ]
+            inputs[0].set_data_from_numpy(batch)
+
+            outputs = [httpclient.InferRequestedOutput(self.output_name)]
+            result = self.client.infer(
+                model_name=self.model_name,
+                inputs=inputs,
+                outputs=outputs,
             )
+
+            logits = result.as_numpy(self.output_name)
+            if logits is None:
+                raise RuntimeError(
+                    f"No output named '{self.output_name}' returned from Triton model '{self.model_name}'."
+                )
+
+            logits = np.asarray(logits, dtype=np.float32)
+            if logits.ndim == 1:
+                logits = logits.reshape(1, -1)
+            elif logits.ndim == 3:
+                logits = logits[:, 0, :]
+            elif logits.ndim > 3:
+                logits = logits.reshape((logits.shape[0], -1))
+
+            probs = softmax(logits)
+            for row_logits, row_probs in zip(logits, probs):
+                class_index = int(np.argmax(row_probs))
+                label = self.labels[class_index] if class_index < len(self.labels) else str(class_index)
+                results.append(
+                    {
+                        "status": "classified",
+                        "backend": "triton",
+                        "label": label,
+                        "class_index": class_index,
+                        "confidence": float(row_probs[class_index]),
+                        "logits": row_logits.astype(float).tolist(),
+                        "scores": {
+                            label_name: float(row_probs[idx])
+                            for idx, label_name in enumerate(self.labels)
+                            if idx < len(row_probs)
+                        },
+                    }
+                )
 
         return results

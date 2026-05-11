@@ -1,7 +1,7 @@
 name: "nfa_vit"
 backend: "onnxruntime"
 default_model_filename: "nfa_vit.onnx"
-max_batch_size: 16
+max_batch_size: 8
 
 input [
   {
@@ -17,7 +17,8 @@ input [
   {
     name: "label"
     data_type: TYPE_FP32
-    dims: [ ]
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
   }
 ]
 
@@ -30,7 +31,8 @@ output [
   {
     name: "pred_label"
     data_type: TYPE_FP32
-    dims: [ ]
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
   }
 ]
 
@@ -43,6 +45,6 @@ instance_group [
 ]
 
 dynamic_batching {
-  preferred_batch_size: [ 1, 4, 8, 16 ]
+  preferred_batch_size: [ 1, 4, 8 ]
   max_queue_delay_microseconds: 5000
 }
