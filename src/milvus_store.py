@@ -28,6 +28,7 @@ logger = logging.getLogger("pipeline-fastapi")
 
 CACHE_JSON_MAX_LENGTH = 65535
 CACHE_SKIP_REASON_MAX_LENGTH = 512
+CACHE_FINAL_LABEL_MAX_LENGTH = 64
 
 
 class MilvusDedupStore:
@@ -127,6 +128,8 @@ class MilvusDedupStore:
                     "image_id",
                     "pipeline_stage",
                     "classification_json",
+                    "nfa_json",
+                    "final_label",
                     "vlm_json",
                     "openai_skipped",
                     "skip_reason",
@@ -148,6 +151,8 @@ class MilvusDedupStore:
                     "image_sha256": image_sha256,
                     "pipeline_stage": row.get("pipeline_stage"),
                     "classification": classification,
+                    "nfa_vit": self._deserialize_json_field(row.get("nfa_json")),
+                    "final_label": row.get("final_label") or None,
                     "vlm": self._deserialize_json_field(row.get("vlm_json")),
                     "openai_skipped": bool(row.get("openai_skipped")),
                     "skip_reason": row.get("skip_reason") or None,
@@ -240,9 +245,22 @@ class MilvusDedupStore:
                 )
                 continue
 
+            nfa_json = self._serialize_json_field(row.get("nfa_vit"))
+            if row.get("nfa_vit") is not None and nfa_json is None:
+                logger.warning(
+                    "Skipping insert because nfa_vit payload is too large: image_id=%s sha256=%s",
+                    image_id,
+                    sha256,
+                )
+                continue
+
             skip_reason = row.get("skip_reason")
             if skip_reason is not None:
                 skip_reason = str(skip_reason)[:CACHE_SKIP_REASON_MAX_LENGTH]
+
+            final_label = row.get("final_label")
+            if final_label is not None:
+                final_label = str(final_label)[:CACHE_FINAL_LABEL_MAX_LENGTH]
 
             rows_to_insert.append(
                 {
@@ -252,6 +270,8 @@ class MilvusDedupStore:
                     "vector": row["vector"],
                     "pipeline_stage": str(row.get("pipeline_stage") or ""),
                     "classification_json": classification_json,
+                    "nfa_json": nfa_json or "",
+                    "final_label": final_label or "",
                     "vlm_json": vlm_json or "",
                     "openai_skipped": bool(row.get("openai_skipped")),
                     "skip_reason": skip_reason or "",
@@ -268,6 +288,8 @@ class MilvusDedupStore:
                 np.stack([row["vector"] for row in rows_to_insert]).astype(np.float32).tolist(),
                 [row["pipeline_stage"] for row in rows_to_insert],
                 [row["classification_json"] for row in rows_to_insert],
+                [row["nfa_json"] for row in rows_to_insert],
+                [row["final_label"] for row in rows_to_insert],
                 [row["vlm_json"] for row in rows_to_insert],
                 [row["openai_skipped"] for row in rows_to_insert],
                 [row["skip_reason"] for row in rows_to_insert],
@@ -333,6 +355,16 @@ class MilvusDedupStore:
                 max_length=CACHE_JSON_MAX_LENGTH,
             ),
             FieldSchema(
+                name="nfa_json",
+                dtype=DataType.VARCHAR,
+                max_length=CACHE_JSON_MAX_LENGTH,
+            ),
+            FieldSchema(
+                name="final_label",
+                dtype=DataType.VARCHAR,
+                max_length=CACHE_FINAL_LABEL_MAX_LENGTH,
+            ),
+            FieldSchema(
                 name="vlm_json",
                 dtype=DataType.VARCHAR,
                 max_length=CACHE_JSON_MAX_LENGTH,
@@ -378,6 +410,8 @@ class MilvusDedupStore:
             "vector",
             "pipeline_stage",
             "classification_json",
+            "nfa_json",
+            "final_label",
             "vlm_json",
             "openai_skipped",
             "skip_reason",

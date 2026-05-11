@@ -79,6 +79,18 @@ class Settings:
     classification_labels: list[str]
     classification_image_size: int | None
 
+    nfa_model_name: str
+    nfa_image_input_name: str
+    nfa_mask_input_name: str
+    nfa_label_input_name: str
+    nfa_mask_output_name: str
+    nfa_label_output_name: str
+    nfa_image_size: int
+    nfa_threshold: float
+    nfa_white_ratio_threshold: float
+    nfa_label_value: float
+    nfa_preprocess_mode: str
+
     openai_model: str
     openai_proxy: str | None
     openai_timeout: float
@@ -142,6 +154,40 @@ class Settings:
                 "AI_IMAGE_SIZE",
                 "AI_DEFAULT_IMAGE_SIZE",
             ),
+            nfa_model_name=_required_env("NFA_MODEL_NAME", "nfa_vit"),
+            nfa_image_input_name=_required_env("NFA_IMAGE_INPUT_NAME", "image"),
+            nfa_mask_input_name=_required_env("NFA_MASK_INPUT_NAME", "mask"),
+            nfa_label_input_name=_required_env("NFA_LABEL_INPUT_NAME", "label"),
+            nfa_mask_output_name=_required_env("NFA_MASK_OUTPUT_NAME", "pred_mask"),
+            nfa_label_output_name=_required_env("NFA_LABEL_OUTPUT_NAME", "pred_label"),
+            nfa_image_size=int(
+                _required_env(
+                    "NFA_IMAGE_SIZE",
+                    _optional_env("NFA_DEFAULT_IMAGE_SIZE") or "512",
+                )
+            ),
+            nfa_threshold=float(
+                _required_env(
+                    "NFA_THRESHOLD",
+                    _optional_env("NFA_DEFAULT_THRESHOLD") or "0.5",
+                )
+            ),
+            nfa_white_ratio_threshold=float(
+                _required_env(
+                    "NFA_WHITE_RATIO_THRESHOLD",
+                    _optional_env("WHITE_RATIO_TRUE_THRESHOLD") or "0.06",
+                )
+            ),
+            nfa_label_value=float(
+                _required_env(
+                    "NFA_LABEL_VALUE",
+                    _optional_env("NFA_DEFAULT_LABEL_VALUE") or "0.0",
+                )
+            ),
+            nfa_preprocess_mode=_required_env(
+                "NFA_PREPROCESS_MODE",
+                "resizing",
+            ).lower(),
             openai_model=_required_env("OPENAI_VLM_MODEL", "gpt-5-mini"),
             openai_proxy=_optional_env("OPENAI_PROXY"),
             openai_timeout=float(_required_env("OPENAI_TIMEOUT", "60")),

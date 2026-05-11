@@ -15,6 +15,7 @@ from src.config import Settings
 from src.dedup_service import DedupService
 from src.image_io import bytes_from_ref, bytes_to_pil, image_ref_for_openai
 from src.milvus_store import MilvusDedupStore
+from src.nfa_vit import TritonNfaVitClient
 from src.triton_clients import TritonClassificationClient, TritonEmbeddingClient
 
 
@@ -93,7 +94,7 @@ class OpenAIVisionClient:
         self,
         image_ref: str,
         prompt: str,
-        classification: dict[str, Any],
+        detector_context: dict[str, Any],
     ) -> dict[str, Any]:
         import json
 
@@ -107,8 +108,8 @@ class OpenAIVisionClient:
                             "type": "input_text",
                             "text": (
                                 f"{prompt}\n\n"
-                                "Triton classification result:\n"
-                                f"{json.dumps(classification, ensure_ascii=False)}"
+                                "Internal detector context:\n"
+                                f"{json.dumps(detector_context, ensure_ascii=False)}"
                             ),
                         },
                         {
@@ -133,6 +134,7 @@ class PipelineRuntime:
     cfg: Settings
     dedup_service: DedupService
     classifier: TritonClassificationClient
+    nfa_vit_client: TritonNfaVitClient
     openai_client: OpenAIVisionClient
 
 
@@ -159,6 +161,21 @@ def build_runtime() -> PipelineRuntime:
         labels=cfg.classification_labels,
         timeout=cfg.request_timeout,
     )
+    nfa_vit_client = TritonNfaVitClient(
+        url=cfg.triton_client_url,
+        model_name=cfg.nfa_model_name,
+        image_input_name=cfg.nfa_image_input_name,
+        mask_input_name=cfg.nfa_mask_input_name,
+        label_input_name=cfg.nfa_label_input_name,
+        mask_output_name=cfg.nfa_mask_output_name,
+        label_output_name=cfg.nfa_label_output_name,
+        image_size=cfg.nfa_image_size,
+        threshold=cfg.nfa_threshold,
+        white_ratio_threshold=cfg.nfa_white_ratio_threshold,
+        label_value=cfg.nfa_label_value,
+        preprocess_mode=cfg.nfa_preprocess_mode,
+        timeout=cfg.request_timeout,
+    )
 
     store = MilvusDedupStore(cfg)
     dedup_service = DedupService(
@@ -178,6 +195,7 @@ def build_runtime() -> PipelineRuntime:
         cfg=cfg,
         dedup_service=dedup_service,
         classifier=classifier,
+        nfa_vit_client=nfa_vit_client,
         openai_client=openai_client,
     )
 
@@ -187,17 +205,12 @@ def health(runtime: PipelineRuntime) -> bool:
         return (
             runtime.dedup_service.health()
             and runtime.classifier.is_ready()
+            and runtime.nfa_vit_client.is_ready()
             and runtime.openai_client is not None
         )
     except Exception:
         logger.exception("Health check failed.")
         return False
-
-
-def is_fake_classification(classification: dict[str, Any]) -> bool:
-    """Return True only when Triton classification label is fake."""
-    label = classification.get("label")
-    return isinstance(label, str) and label.strip().lower() == "fake"
 
 def build_cached_payload(
     *,
@@ -214,6 +227,8 @@ def build_cached_payload(
         "image_sha256": image_sha256,
         "pipeline_stage": pipeline_result.get("stage"),
         "classification": deepcopy(classification),
+        "nfa_vit": deepcopy(pipeline_result.get("nfa_vit")),
+        "final_label": pipeline_result.get("final_label"),
         "vlm": deepcopy(pipeline_result.get("vlm")),
         "openai_skipped": bool(pipeline_result.get("openai_skipped")),
         "skip_reason": pipeline_result.get("skip_reason"),
@@ -233,6 +248,8 @@ def build_duplicate_cache_response(
         "stage": cached_payload.get("pipeline_stage") or "dedup",
         "dedup": dedup_result,
         "classification": deepcopy(cached_payload.get("classification")),
+        "nfa_vit": deepcopy(cached_payload.get("nfa_vit")),
+        "final_label": cached_payload.get("final_label"),
         "vlm": deepcopy(cached_payload.get("vlm")),
         "served_from_cache": True,
         "cache_source": cache_source,
@@ -299,6 +316,8 @@ def run_pipeline_on_items(
         else {}
     )
 
+    nfa_call_count = 0
+    nfa_total_elapsed = 0.0
     openai_call_count = 0
     openai_total_elapsed = 0.0
     cached_payload_by_image_id: dict[str, dict[str, Any]] = {}
@@ -337,7 +356,7 @@ def run_pipeline_on_items(
                     cached_payload_by_sha256[matched_sha256] = cached_payload
             elif matched_sha256:
                 logger.info(
-                    "Duplicate cache miss. Rebuilding classification/VLM result: image_id=%s matched_image_id=%s matched_sha256=%s",
+                    "Duplicate cache miss. Rebuilding classification/nfa_vit/OpenAI result: image_id=%s matched_image_id=%s matched_sha256=%s",
                     item["image_id"],
                     matched_image_id,
                     matched_sha256,
@@ -348,47 +367,53 @@ def run_pipeline_on_items(
                     if duplicate_classification.get("status") != "classified":
                         raise RuntimeError("duplicate_cache_rebuild_classification_failed")
 
-                    if not is_fake_classification(duplicate_classification):
-                        pipeline_results.append(
-                            {
-                                "image_id": item["image_id"],
-                                "status": "completed",
-                                "stage": "classification",
-                                "dedup": dedup_result,
-                                "classification": duplicate_classification,
-                                "vlm": None,
-                                "openai_skipped": True,
-                                "skip_reason": "classification_label_is_not_fake",
-                                "cache_backfilled": True,
-                            }
-                        )
-                    else:
-                        openai_started = time.perf_counter()
-                        duplicate_vlm_result = runtime.openai_client.analyze(
-                            image_ref=image_ref_for_openai(item["image_ref"]),
-                            prompt=runtime.cfg.vlm_prompt,
-                            classification=duplicate_classification,
-                        )
-                        openai_elapsed = time.perf_counter() - openai_started
-                        openai_call_count += 1
-                        openai_total_elapsed += openai_elapsed
-                        logger.info(
-                            "OpenAI VLM completed during duplicate cache rebuild: image_id=%s model=%s elapsed_seconds=%.4f",
-                            item["image_id"],
-                            runtime.cfg.openai_model,
-                            openai_elapsed,
-                        )
-                        pipeline_results.append(
-                            {
-                                "image_id": item["image_id"],
-                                "status": "completed",
-                                "stage": "openai",
-                                "dedup": dedup_result,
-                                "classification": duplicate_classification,
-                                "vlm": duplicate_vlm_result,
-                                "cache_backfilled": True,
-                            }
-                        )
+                    nfa_started = time.perf_counter()
+                    duplicate_nfa_vit = runtime.nfa_vit_client.infer(duplicate_image)
+                    nfa_elapsed = time.perf_counter() - nfa_started
+                    nfa_call_count += 1
+                    nfa_total_elapsed += nfa_elapsed
+                    logger.info(
+                        "nfa_vit completed during duplicate cache rebuild: image_id=%s model=%s elapsed_seconds=%.4f final_label=%s",
+                        item["image_id"],
+                        runtime.cfg.nfa_model_name,
+                        nfa_elapsed,
+                        duplicate_nfa_vit.get("final_label"),
+                    )
+
+                    detector_context = {
+                        "classification": duplicate_classification,
+                        "nfa_vit": duplicate_nfa_vit,
+                        "final_label": duplicate_nfa_vit.get("final_label"),
+                    }
+
+                    openai_started = time.perf_counter()
+                    duplicate_vlm_result = runtime.openai_client.analyze(
+                        image_ref=image_ref_for_openai(item["image_ref"]),
+                        prompt=runtime.cfg.vlm_prompt,
+                        detector_context=detector_context,
+                    )
+                    openai_elapsed = time.perf_counter() - openai_started
+                    openai_call_count += 1
+                    openai_total_elapsed += openai_elapsed
+                    logger.info(
+                        "OpenAI VLM completed during duplicate cache rebuild: image_id=%s model=%s elapsed_seconds=%.4f",
+                        item["image_id"],
+                        runtime.cfg.openai_model,
+                        openai_elapsed,
+                    )
+                    pipeline_results.append(
+                        {
+                            "image_id": item["image_id"],
+                            "status": "completed",
+                            "stage": "openai",
+                            "dedup": dedup_result,
+                            "classification": duplicate_classification,
+                            "nfa_vit": duplicate_nfa_vit,
+                            "final_label": duplicate_nfa_vit.get("final_label"),
+                            "vlm": duplicate_vlm_result,
+                            "cache_backfilled": True,
+                        }
+                    )
 
                     cached_payload = build_cached_payload(
                         image_id=str(matched_image_id or item["image_id"]),
@@ -452,55 +477,44 @@ def run_pipeline_on_items(
             )
             continue
 
-        # Only fake images should be sent to OpenAI VLM.
-        # Real images stop here after Triton classification.
-        if not is_fake_classification(classification):
+        record = unique_by_flat_idx[idx]
+        try:
+            nfa_started = time.perf_counter()
+            nfa_vit_result = runtime.nfa_vit_client.infer(record["image"])
+            nfa_elapsed = time.perf_counter() - nfa_started
+            nfa_call_count += 1
+            nfa_total_elapsed += nfa_elapsed
             logger.info(
-                "OpenAI VLM skipped: image_id=%s classification_label=%s reason=classification_label_is_not_fake",
+                "nfa_vit completed: image_id=%s model=%s elapsed_seconds=%.4f final_label=%s",
                 item["image_id"],
-                classification.get("label"),
+                runtime.cfg.nfa_model_name,
+                nfa_elapsed,
+                nfa_vit_result.get("final_label"),
             )
+        except Exception as exc:
             pipeline_results.append(
                 {
                     "image_id": item["image_id"],
-                    "status": "completed",
-                    "stage": "classification",
+                    "status": "error",
+                    "stage": "nfa_vit",
                     "dedup": dedup_result,
                     "classification": classification,
-                    "vlm": None,
-                    "openai_skipped": True,
-                    "skip_reason": "classification_label_is_not_fake",
+                    "error": str(exc),
                 }
             )
-            cached_payload = build_cached_payload(
-                image_id=item["image_id"],
-                image_sha256=dedup_result.get("sha256"),
-                pipeline_result=pipeline_results[-1],
-            )
-            if cached_payload and dedup_result.get("sha256"):
-                cached_payload_by_image_id[item["image_id"]] = cached_payload
-                cached_payload_by_sha256[dedup_result["sha256"]] = cached_payload
-                record = unique_by_flat_idx[idx]
-                processed_rows_to_insert[dedup_result["sha256"]] = {
-                    "flat_idx": idx,
-                    "image_id": item["image_id"],
-                    "sha256": dedup_result["sha256"],
-                    "vector": record["vector"],
-                    "pipeline_stage": "classification",
-                    "classification": classification,
-                    "vlm": None,
-                    "openai_skipped": True,
-                    "skip_reason": "classification_label_is_not_fake",
-                }
             continue
 
-        record = unique_by_flat_idx[idx]
+        detector_context = {
+            "classification": classification,
+            "nfa_vit": nfa_vit_result,
+            "final_label": nfa_vit_result.get("final_label"),
+        }
         try:
             openai_started = time.perf_counter()
             vlm_result = runtime.openai_client.analyze(
                 image_ref=image_ref_for_openai(record["image_ref"]),
                 prompt=runtime.cfg.vlm_prompt,
-                classification=classification,
+                detector_context=detector_context,
             )
             openai_elapsed = time.perf_counter() - openai_started
             openai_call_count += 1
@@ -527,6 +541,8 @@ def run_pipeline_on_items(
                     "stage": "openai",
                     "dedup": dedup_result,
                     "classification": classification,
+                    "nfa_vit": nfa_vit_result,
+                    "final_label": nfa_vit_result.get("final_label"),
                     "error": str(exc),
                 }
             )
@@ -539,6 +555,8 @@ def run_pipeline_on_items(
                 "stage": "openai",
                 "dedup": dedup_result,
                 "classification": classification,
+                "nfa_vit": nfa_vit_result,
+                "final_label": nfa_vit_result.get("final_label"),
                 "vlm": vlm_result,
             }
         )
@@ -557,10 +575,22 @@ def run_pipeline_on_items(
                 "vector": record["vector"],
                 "pipeline_stage": "openai",
                 "classification": classification,
+                "nfa_vit": nfa_vit_result,
+                "final_label": nfa_vit_result.get("final_label"),
                 "vlm": vlm_result,
                 "openai_skipped": False,
                 "skip_reason": None,
             }
+
+    if nfa_call_count:
+        logger.info(
+            "nfa_vit summary: calls=%s total_elapsed_seconds=%.4f avg_seconds_per_call=%.4f",
+            nfa_call_count,
+            nfa_total_elapsed,
+            nfa_total_elapsed / nfa_call_count,
+        )
+    else:
+        logger.info("nfa_vit summary: calls=0 total_elapsed_seconds=0.0000")
 
     if openai_call_count:
         logger.info(
@@ -636,7 +666,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Triton Dedup Classification OpenAI API",
+    title="Triton Dedup Classification NFA OpenAI API",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -656,7 +686,7 @@ async def healthz(request: Request) -> dict[str, Any]:
     if not is_healthy:
         raise HTTPException(
             status_code=503,
-            detail="Triton, Milvus, or OpenAI runtime is not ready.",
+            detail="Triton, Milvus, NFA, or OpenAI runtime is not ready.",
         )
     return {"status": "ok"}
 

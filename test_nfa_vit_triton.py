@@ -243,7 +243,7 @@ def infer(args: argparse.Namespace) -> dict:
         pred_mask,
         threshold=args.threshold,
     )
-    final_label = "true" if white_ratio < args.white_ratio_threshold else "fake"
+    final_label = "real" if white_ratio < args.white_ratio_threshold else "fake"
 
     if args.save_mask:
         output_path = Path(args.save_mask)

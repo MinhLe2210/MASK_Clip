@@ -3,7 +3,7 @@
 OpenSDI now runs a single Triton-based pipeline:
 
 ```text
-input image -> Triton dedup embedding model -> Milvus dedup -> Triton classification -> OpenAI vision analysis
+input image -> Triton dedup embedding model -> Milvus dedup -> Triton classification -> Triton nfa_vit -> final label -> OpenAI vision analysis
 ```
 
 All old local TensorRT service logic has been removed from the main flow. The repo now exposes one LitServe API endpoint: `/analyze`.
@@ -21,7 +21,10 @@ All old local TensorRT service logic has been removed from the main flow. The re
 |   |-- AI_images_detector/
 |   |   |-- 1/
 |   |   `-- config.pbtxt
-|   `-- dedup_embedder/
+|   |-- dedup_embedder/
+|   |   |-- 1/
+|   |   `-- config.pbtxt
+|   `-- nfa_vit/
 |       |-- 1/
 |       `-- config.pbtxt
 `-- src/
@@ -29,14 +32,16 @@ All old local TensorRT service logic has been removed from the main flow. The re
     |-- dedup_service.py
     |-- image_io.py
     |-- milvus_store.py
+    |-- nfa_vit.py
     `-- triton_clients.py
 ```
 
 ## Required Services
 
-- Triton Inference Server with two models:
+- Triton Inference Server with three models:
   - `dedup_embedder`
   - `AI_images_detector`
+  - `nfa_vit`
 - Milvus
 - OpenAI API access
 
@@ -66,6 +71,18 @@ export CLASSIFIER_INPUT_NAME=pixel_values
 export CLASSIFIER_OUTPUT_NAME=logits
 export CLASSIFIER_LABELS=fake,real
 export CLASSIFIER_INPUT_SIZE=384
+
+export NFA_MODEL_NAME=nfa_vit
+export NFA_IMAGE_INPUT_NAME=image
+export NFA_MASK_INPUT_NAME=mask
+export NFA_LABEL_INPUT_NAME=label
+export NFA_MASK_OUTPUT_NAME=pred_mask
+export NFA_LABEL_OUTPUT_NAME=pred_label
+export NFA_IMAGE_SIZE=512
+export NFA_THRESHOLD=0.5
+export NFA_WHITE_RATIO_THRESHOLD=0.06
+export NFA_LABEL_VALUE=0.0
+export NFA_PREPROCESS_MODE=resizing
 ```
 
 Milvus and dedup:
@@ -116,8 +133,8 @@ python pipeline_client.py --image-url https://example.com/sample.jpg
 
 `docker-compose.yml` runs:
 
-- `triton`: serves `dedup_embedder` and `AI_images_detector`
-- `pipeline`: LitServe API that calls Triton, Milvus, and OpenAI
+- `triton`: serves `dedup_embedder`, `AI_images_detector`, and `nfa_vit`
+- `pipeline`: FastAPI service that calls Triton, Milvus, and OpenAI
 
 Run:
 
@@ -139,6 +156,8 @@ Place the actual model files into:
 ```text
 model_repository/AI_images_detector/1/model.onnx
 model_repository/dedup_embedder/1/model.onnx
+model_repository/nfa_vit/1/nfa_vit.onnx
+model_repository/nfa_vit/1/nfa_vit.onnx.data
 ```
 
 The provided `config.pbtxt` files assume:
@@ -147,5 +166,12 @@ The provided `config.pbtxt` files assume:
 - dedup output: `features`
 - classification input: `pixel_values`
 - classification output: `logits`
+- nfa input: `image`, `mask`, `label`
+- nfa output: `pred_mask`, `pred_label`
 
 Adjust the config or env if your ONNX signatures differ.
+
+## Migration Note
+
+The Milvus cache schema now stores `nfa_vit` output and `final_label`.
+If you already have an existing collection created by an older version of the pipeline, delete that collection before restarting so the API can recreate it with the new fields.

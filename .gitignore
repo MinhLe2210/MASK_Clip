@@ -30,11 +30,20 @@ dist/
 !.env.example
 
 # Model and inference artifacts
-model_repository/
 models/
 *.onnx
+*.onnx.data
 *.engine
 *.plan
+
+# Keep Triton repo config in git, but ignore model weights/artifacts.
+model_repository/*
+!model_repository/*/
+model_repository/*/*
+!model_repository/*/config.pbtxt
+!model_repository/*/1/
+model_repository/*/1/*
+!model_repository/*/1/.gitkeep
 
 # Logs and runtime output
 *.log
