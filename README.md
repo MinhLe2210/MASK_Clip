@@ -3,7 +3,7 @@
 OpenSDI now runs a single Triton-based pipeline:
 
 ```text
-input image -> Triton dedup embedding model -> Milvus dedup -> Triton classification -> Triton nfa_vit -> final label -> OpenAI vision analysis
+input image -> Triton dedup embedding model -> Milvus dedup -> Triton classification -> if fake then Triton nfa_vit -> final label -> OpenAI vision analysis
 ```
 
 All old local TensorRT service logic has been removed from the main flow. The repo now exposes one LitServe API endpoint: `/analyze`.

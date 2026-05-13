@@ -274,14 +274,27 @@ def build_duplicate_cache_response(
     cached_payload: dict[str, Any],
     cache_source: str,
 ) -> dict[str, Any]:
+    classification = deepcopy(cached_payload.get("classification"))
+    nfa_vit = deepcopy(cached_payload.get("nfa_vit"))
+    final_label = cached_payload.get("final_label")
+
+    if should_run_nfa_vit(classification):
+        if isinstance(nfa_vit, dict):
+            final_label = nfa_vit.get("final_label") or final_label
+        if isinstance(classification, dict):
+            final_label = final_label or classification.get("label")
+    elif isinstance(classification, dict):
+        nfa_vit = None
+        final_label = classification.get("label")
+
     result = {
         "image_id": image_id,
         "status": "completed",
         "stage": cached_payload.get("pipeline_stage") or "dedup",
         "dedup": dedup_result,
-        "classification": deepcopy(cached_payload.get("classification")),
-        "nfa_vit": deepcopy(cached_payload.get("nfa_vit")),
-        "final_label": cached_payload.get("final_label"),
+        "classification": classification,
+        "nfa_vit": nfa_vit,
+        "final_label": final_label,
         "vlm": deepcopy(cached_payload.get("vlm")),
         "served_from_cache": True,
         "cache_source": cache_source,
@@ -293,6 +306,29 @@ def build_duplicate_cache_response(
     if cached_payload.get("skip_reason"):
         result["skip_reason"] = cached_payload.get("skip_reason")
     return result
+
+
+def should_run_nfa_vit(classification: dict[str, Any] | None) -> bool:
+    if not isinstance(classification, dict):
+        return False
+
+    label = classification.get("label")
+    if not isinstance(label, str):
+        return False
+
+    return label.strip().lower() == "fake"
+
+
+def build_detector_context(
+    classification: dict[str, Any],
+    nfa_vit_result: dict[str, Any] | None,
+    final_label: str | None,
+) -> dict[str, Any]:
+    return {
+        "classification": classification,
+        "nfa_vit": nfa_vit_result,
+        "final_label": final_label,
+    }
 
 
 def run_pipeline_on_items(
@@ -388,7 +424,7 @@ def run_pipeline_on_items(
                     cached_payload_by_sha256[matched_sha256] = cached_payload
             elif matched_sha256:
                 logger.info(
-                    "Duplicate cache miss. Rebuilding classification/nfa_vit/OpenAI result: image_id=%s matched_image_id=%s matched_sha256=%s",
+                    "Duplicate cache miss. Rebuilding classification/final/OpenAI result: image_id=%s matched_image_id=%s matched_sha256=%s",
                     item["image_id"],
                     matched_image_id,
                     matched_sha256,
@@ -399,24 +435,36 @@ def run_pipeline_on_items(
                     if duplicate_classification.get("status") != "classified":
                         raise RuntimeError("duplicate_cache_rebuild_classification_failed")
 
-                    nfa_started = time.perf_counter()
-                    duplicate_nfa_vit = runtime.nfa_vit_client.infer(duplicate_image)
-                    nfa_elapsed = time.perf_counter() - nfa_started
-                    nfa_call_count += 1
-                    nfa_total_elapsed += nfa_elapsed
-                    logger.info(
-                        "nfa_vit completed during duplicate cache rebuild: image_id=%s model=%s elapsed_seconds=%.4f final_label=%s",
-                        item["image_id"],
-                        runtime.cfg.nfa_model_name,
-                        nfa_elapsed,
-                        duplicate_nfa_vit.get("final_label"),
-                    )
+                    duplicate_nfa_vit = None
+                    duplicate_final_label = duplicate_classification.get("label")
+                    if should_run_nfa_vit(duplicate_classification):
+                        nfa_started = time.perf_counter()
+                        duplicate_nfa_vit = runtime.nfa_vit_client.infer(duplicate_image)
+                        nfa_elapsed = time.perf_counter() - nfa_started
+                        nfa_call_count += 1
+                        nfa_total_elapsed += nfa_elapsed
+                        duplicate_final_label = (
+                            duplicate_nfa_vit.get("final_label") or duplicate_final_label
+                        )
+                        logger.info(
+                            "nfa_vit completed during duplicate cache rebuild: image_id=%s model=%s elapsed_seconds=%.4f final_label=%s",
+                            item["image_id"],
+                            runtime.cfg.nfa_model_name,
+                            nfa_elapsed,
+                            duplicate_final_label,
+                        )
+                    else:
+                        logger.info(
+                            "nfa_vit skipped during duplicate cache rebuild: image_id=%s classification_label=%s",
+                            item["image_id"],
+                            duplicate_classification.get("label"),
+                        )
 
-                    detector_context = {
-                        "classification": duplicate_classification,
-                        "nfa_vit": duplicate_nfa_vit,
-                        "final_label": duplicate_nfa_vit.get("final_label"),
-                    }
+                    detector_context = build_detector_context(
+                        duplicate_classification,
+                        duplicate_nfa_vit,
+                        duplicate_final_label,
+                    )
 
                     openai_started = time.perf_counter()
                     duplicate_vlm_result = runtime.openai_client.analyze(
@@ -441,7 +489,7 @@ def run_pipeline_on_items(
                             "dedup": dedup_result,
                             "classification": duplicate_classification,
                             "nfa_vit": duplicate_nfa_vit,
-                            "final_label": duplicate_nfa_vit.get("final_label"),
+                            "final_label": duplicate_final_label,
                             "vlm": duplicate_vlm_result,
                             "cache_backfilled": True,
                         }
@@ -510,37 +558,47 @@ def run_pipeline_on_items(
             continue
 
         record = unique_by_flat_idx[idx]
-        try:
-            nfa_started = time.perf_counter()
-            nfa_vit_result = runtime.nfa_vit_client.infer(record["image"])
-            nfa_elapsed = time.perf_counter() - nfa_started
-            nfa_call_count += 1
-            nfa_total_elapsed += nfa_elapsed
+        nfa_vit_result = None
+        final_label = classification.get("label")
+        if should_run_nfa_vit(classification):
+            try:
+                nfa_started = time.perf_counter()
+                nfa_vit_result = runtime.nfa_vit_client.infer(record["image"])
+                nfa_elapsed = time.perf_counter() - nfa_started
+                nfa_call_count += 1
+                nfa_total_elapsed += nfa_elapsed
+                final_label = nfa_vit_result.get("final_label") or final_label
+                logger.info(
+                    "nfa_vit completed: image_id=%s model=%s elapsed_seconds=%.4f final_label=%s",
+                    item["image_id"],
+                    runtime.cfg.nfa_model_name,
+                    nfa_elapsed,
+                    final_label,
+                )
+            except Exception as exc:
+                pipeline_results.append(
+                    {
+                        "image_id": item["image_id"],
+                        "status": "error",
+                        "stage": "nfa_vit",
+                        "dedup": dedup_result,
+                        "classification": classification,
+                        "error": str(exc),
+                    }
+                )
+                continue
+        else:
             logger.info(
-                "nfa_vit completed: image_id=%s model=%s elapsed_seconds=%.4f final_label=%s",
+                "nfa_vit skipped: image_id=%s classification_label=%s",
                 item["image_id"],
-                runtime.cfg.nfa_model_name,
-                nfa_elapsed,
-                nfa_vit_result.get("final_label"),
+                classification.get("label"),
             )
-        except Exception as exc:
-            pipeline_results.append(
-                {
-                    "image_id": item["image_id"],
-                    "status": "error",
-                    "stage": "nfa_vit",
-                    "dedup": dedup_result,
-                    "classification": classification,
-                    "error": str(exc),
-                }
-            )
-            continue
 
-        detector_context = {
-            "classification": classification,
-            "nfa_vit": nfa_vit_result,
-            "final_label": nfa_vit_result.get("final_label"),
-        }
+        detector_context = build_detector_context(
+            classification,
+            nfa_vit_result,
+            final_label,
+        )
         try:
             openai_started = time.perf_counter()
             vlm_result = runtime.openai_client.analyze(
@@ -574,7 +632,7 @@ def run_pipeline_on_items(
                     "dedup": dedup_result,
                     "classification": classification,
                     "nfa_vit": nfa_vit_result,
-                    "final_label": nfa_vit_result.get("final_label"),
+                    "final_label": final_label,
                     "error": str(exc),
                 }
             )
@@ -588,7 +646,7 @@ def run_pipeline_on_items(
                 "dedup": dedup_result,
                 "classification": classification,
                 "nfa_vit": nfa_vit_result,
-                "final_label": nfa_vit_result.get("final_label"),
+                "final_label": final_label,
                 "vlm": vlm_result,
             }
         )
@@ -608,7 +666,7 @@ def run_pipeline_on_items(
                 "pipeline_stage": "openai",
                 "classification": classification,
                 "nfa_vit": nfa_vit_result,
-                "final_label": nfa_vit_result.get("final_label"),
+                "final_label": final_label,
                 "vlm": vlm_result,
                 "openai_skipped": False,
                 "skip_reason": None,
