@@ -17,12 +17,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image",
-        default="image.png",
+        default="image3.png",
         help="Local image path.",
     )
     parser.add_argument(
         "--triton-url",
-        default="http://127.0.0.1:30000",
+        default="http://172.20.152.100:32455",
         help="Triton HTTP base URL.",
     )
     parser.add_argument(
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--white-ratio-threshold",
         type=float,
-        default=0.06,
+        default=0.001,
         help="white_ratio cutoff used to derive final_label.",
     )
     parser.add_argument(

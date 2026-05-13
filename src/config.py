@@ -175,7 +175,7 @@ class Settings:
             nfa_white_ratio_threshold=float(
                 _required_env(
                     "NFA_WHITE_RATIO_THRESHOLD",
-                    _optional_env("WHITE_RATIO_TRUE_THRESHOLD") or "0.06",
+                    _optional_env("WHITE_RATIO_TRUE_THRESHOLD") or "0.01",
                 )
             ),
             nfa_label_value=float(

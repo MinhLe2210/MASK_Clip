@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 import time
@@ -8,12 +9,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from src.config import Settings
 from src.dedup_service import DedupService
-from src.image_io import bytes_from_ref, bytes_to_pil, image_ref_for_openai
+from src.image_io import (
+    bytes_from_ref,
+    bytes_to_data_url,
+    bytes_to_pil,
+    guess_image_mime,
+    image_ref_for_openai,
+)
 from src.milvus_store import MilvusDedupStore
 from src.nfa_vit import TritonNfaVitClient
 from src.triton_clients import TritonClassificationClient, TritonEmbeddingClient
@@ -25,6 +32,14 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("pipeline-fastapi")
 
 
+def upload_to_image_ref(content: bytes, filename: str | None, content_type: str | None) -> str:
+    mime = content_type if content_type and content_type.startswith("image/") else None
+    if not mime:
+        mime = guess_image_mime(content, filename)
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def normalize_images_payload(
     request: dict[str, Any],
     max_images_per_request: int,
@@ -33,16 +48,27 @@ def normalize_images_payload(
 
     if "images" in request:
         images = request["images"]
-    elif "image_base64" in request or "image_url" in request:
+    elif (
+        "image_base64" in request
+        or "image_url" in request
+        or "image_path" in request
+        or "path" in request
+        or "file_path" in request
+    ):
         images = [
             {
                 "image_id": request.get("image_id"),
                 "image_base64": request.get("image_base64"),
                 "image_url": request.get("image_url"),
+                "image_path": request.get("image_path"),
+                "path": request.get("path"),
+                "file_path": request.get("file_path"),
             }
         ]
     else:
-        raise ValueError("Request must contain 'images', 'image_base64', or 'image_url'.")
+        raise ValueError(
+            "Request must contain 'images', 'image_base64', 'image_url', or 'image_path'."
+        )
 
     if not isinstance(images, list):
         raise ValueError("'images' must be a list.")
@@ -61,12 +87,17 @@ def normalize_images_payload(
                 or item.get("b64")
                 or item.get("image_url")
                 or item.get("url")
+                or item.get("image_path")
+                or item.get("path")
+                or item.get("file_path")
             )
         else:
             raise ValueError("Each image must be a string or object.")
 
         if not image_ref or not isinstance(image_ref, str):
-            raise ValueError("Each image must contain image_base64 or image_url.")
+            raise ValueError(
+                "Each image must contain image_base64, image_url, image_path, path, or file_path."
+            )
 
         items.append(
             {
@@ -211,6 +242,7 @@ def health(runtime: PipelineRuntime) -> bool:
     except Exception:
         logger.exception("Health check failed.")
         return False
+
 
 def build_cached_payload(
     *,
@@ -614,8 +646,6 @@ def run_pipeline_on_items(
     return pipeline_results
 
 
-
-
 def build_response(
     runtime: PipelineRuntime,
     request_id: str,
@@ -725,12 +755,78 @@ async def analyze(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+@app.post("/analyze_multipart")
+async def analyze_multipart(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    request_id: str | None = Form(None),
+    image_ids: str | None = Form(None),
+) -> dict[str, Any]:
+    runtime = get_runtime(request)
+
+    if not files:
+        raise HTTPException(status_code=422, detail="At least one file is required.")
+
+    if len(files) > runtime.cfg.max_images_per_request:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many images. Max is {runtime.cfg.max_images_per_request}.",
+        )
+
+    rid = str(request_id or uuid.uuid4())
+
+    parsed_image_ids: list[str] = []
+    if image_ids:
+        parsed_image_ids = [x.strip() for x in image_ids.split(",") if x.strip()]
+
+    items: list[dict[str, Any]] = []
+    for idx, upload in enumerate(files):
+        content = await upload.read()
+        if not content:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Uploaded file is empty: {upload.filename}",
+            )
+
+        image_id = (
+            parsed_image_ids[idx]
+            if idx < len(parsed_image_ids)
+            else upload.filename
+            or f"{rid}:{idx}"
+        )
+
+        items.append(
+            {
+                "request_id": rid,
+                "image_id": image_id,
+                "image_ref": upload_to_image_ref(
+                    content=content,
+                    filename=upload.filename,
+                    content_type=upload.content_type,
+                ),
+            }
+        )
+
+    started = time.perf_counter()
+
+    async with request.app.state.analyze_lock:
+        runtime.dedup_service.store.reset_predict_state()
+        item_results = await run_in_threadpool(run_pipeline_on_items, runtime, items)
+
+    return build_response(
+        runtime=runtime,
+        request_id=rid,
+        item_results=item_results,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
 def main() -> None:
     import uvicorn
 
     uvicorn.run(
         "pipeline_server:app",
-        host=os.getenv("HOST", os.getenv("API_HOST", "127.0.0.1")),
+        host=os.getenv("HOST", os.getenv("API_HOST", "0.0.0.0")),
         port=int(
             os.getenv(
                 "PIPELINE_PORT",
@@ -744,4 +840,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
